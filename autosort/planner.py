@@ -2,10 +2,13 @@
 
 from __future__ import annotations
 
+import json
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Optional
+
+import cv2
 
 from autosort.config import BIN_ANGLES, DEFAULT_BIN, LABEL_ALIASES, SLOT_MAP, SORTING_RULES
 from hardware.platform_control import PlatformController
@@ -33,8 +36,6 @@ class SortAction:
 
 
 class BridgeRPC:
-    """Thin RPC-like interface between the planner and the hardware."""
-
     def __init__(self, rotation_controller: ClosedLoopRotationController, platform: PlatformController):
         self.rotation = rotation_controller
         self.platform = platform
@@ -72,8 +73,6 @@ class BridgeRPC:
 
 
 class AutoSortSystem:
-    """High-level orchestrator for the full sorting cycle."""
-
     CONFIDENCE_FLOOR = 0.45
 
     def __init__(
@@ -90,21 +89,19 @@ class AutoSortSystem:
         self.rotation = ClosedLoopRotationController()
         self.platform = PlatformController()
         self.bridge = BridgeRPC(self.rotation, self.platform)
+
+        self.tmp_dir = Path(__file__).resolve().parent.parent / "tmp"
+        self.tmp_dir.mkdir(parents=True, exist_ok=True)
+
         self.frame_path = (
-            Path(frame_path)
-            if frame_path
-            else Path(__file__).resolve().parent.parent / "tmp" / "autosort_frame.jpg"
+            Path(frame_path) if frame_path else self.tmp_dir / "autosort_frame.jpg"
         )
-        self.frame_path.parent.mkdir(parents=True, exist_ok=True)
+        self.detection_json_path = self.tmp_dir / "latest_detection.json"
         self.hardware_status = HardwareStatus()
 
     def refresh_hardware_status(self) -> HardwareStatus:
-        camera_index = (
-            self.detector.camera_index
-            if self.detector.camera_index is not None
-            else self.detector.find_camera_index()
-        )
-        camera_available = bool(camera_index is not None and self.detector.camera_available)
+        camera_index = self.detector.camera_index
+        camera_available = bool(self.detector.camera_available)
         encoder_available = bool(
             getattr(self.rotation, "encoder_available", False)
             or getattr(self.rotation.servo, "encoder_available", False)
@@ -139,6 +136,54 @@ class AutoSortSystem:
         if best.confidence < self.CONFIDENCE_FLOOR:
             return None
         return best
+
+    def _publish_frame_and_detections(self) -> Optional[DetectionResult]:
+        """Pull frame from vision detector, draw bounding boxes, and save for Streamlit."""
+        frame = self.detector.get_frame()
+        detections = self.detector.get_detections()
+
+        if frame is not None:
+            annotated = frame.copy()
+            for det in detections:
+                if det.bbox:
+                    x1, y1, x2, y2 = map(int, det.bbox)
+                    cv2.rectangle(annotated, (x1, y1), (x2, y2), (0, 255, 0), 2)
+                    cv2.circle(annotated, det.center, 5, (0, 0, 255), -1)
+                    label_text = f"{det.label} {det.confidence:.2f}"
+                    cv2.putText(
+                        annotated,
+                        label_text,
+                        (x1, max(20, y1 - 10)),
+                        cv2.FONT_HERSHEY_SIMPLEX,
+                        0.5,
+                        (0, 255, 0),
+                        2,
+                    )
+            try:
+                cv2.imwrite(str(self.frame_path), annotated)
+            except Exception:
+                pass
+
+        best_detection = None
+        if detections:
+            best = max(detections, key=lambda d: d.confidence)
+            if best.confidence >= self.CONFIDENCE_FLOOR:
+                best_detection = best
+
+        # Update JSON detection record for the dashboard UI
+        try:
+            record = {
+                "timestamp": time.strftime("%Y-%m-%d %H:%M:%S"),
+                "class": best_detection.label if best_detection else None,
+                "confidence": float(best_detection.confidence) if best_detection else 0.0,
+                "bin": self._resolve_bin(best_detection.label) if best_detection else None,
+            }
+            with open(self.detection_json_path, "w") as f:
+                json.dump(record, f)
+        except Exception:
+            pass
+
+        return best_detection
 
     def _resolve_bin(self, label: str) -> str:
         key = (label or "").lower().strip()
@@ -179,23 +224,14 @@ class AutoSortSystem:
         )
 
     def run_sort_cycle(self, detection: Optional[DetectionResult]) -> Optional[SortAction]:
-        """Execute a full sort cycle for a given detection.
-
-        Camera availability is checked at classify time, not here — a detection
-        that already succeeded should not be blocked by a transient camera check.
-        """
         if detection is None:
             return None
-
         action = self.make_sort_action(detection)
         if action is None:
             return None
-
-        # Only skip if the physical platform hardware is genuinely offline
         self.refresh_hardware_status()
         if not self.hardware_status.platform_available:
             return None
-
         self.bridge.run_full_sort_sequence(action)
         return action
 
@@ -203,13 +239,10 @@ class AutoSortSystem:
         try:
             self.detector.start()
         except RuntimeError:
-            self.detector._running = False
-
+            pass
         self.refresh_hardware_status()
-
         if self.hardware_status.encoder_available:
             self.rotation.set_zero()
-            # Explicitly set the full safe arc — no implicit defaults
             self.rotation.set_motion_range(114.0, 229.0)
         else:
             self.rotation.current_angle_deg = 0.0
@@ -222,16 +255,16 @@ class AutoSortSystem:
         except Exception:
             pass
 
-    def run_loop(self, max_cycles: Optional[int] = None, poll_interval: float = 0.25) -> None:
+    def run_loop(self, max_cycles: Optional[int] = None, poll_interval: float = 0.1) -> None:
         cycles = 0
         while max_cycles is None or cycles < max_cycles:
             self.refresh_hardware_status()
-            if not self.hardware_status.camera_available:
+            if not self.detector.camera_available:
                 time.sleep(poll_interval)
                 cycles += 1
                 continue
 
-            detection = self.classify()
+            detection = self._publish_frame_and_detections()
             if detection is not None:
                 self.run_sort_cycle(detection)
                 time.sleep(0.5)

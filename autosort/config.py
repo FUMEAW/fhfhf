@@ -2,9 +2,9 @@
 
 BIN_ANGLES = {
     "recycling": 0.0,
-    "battery": 90.0,
-    "compost": 180.0,
-    "landfill": 270.0,
+    "battery": 0.5,
+    "compost": 1,
+    "landfill": 1
 }
 
 BIN_NAMES = {

@@ -1,13 +1,16 @@
 """Streamlit dashboard for the AutoSort system.
 
-The dashboard reads the latest shared camera frame from disk, shows bin fill
-levels, and renders a running history of sorted items.
+The dashboard reads the latest shared camera frame and detection metadata from disk,
+shows bin fill levels, renders a running history of sorted items, and includes live
+encoder telemetry and manual platform rotation controls.
 """
 
 from __future__ import annotations
 
+import json
 from pathlib import Path
 from typing import Any, Dict, List
+import time
 
 import cv2
 import numpy as np
@@ -17,11 +20,11 @@ from PIL import Image
 
 class AutoSortDashboard:
     def __init__(self, frame_path: str | Path | None = None):
+        self.tmp_dir = Path(__file__).resolve().parent.parent / "tmp"
         self.frame_path = (
-            Path(frame_path)
-            if frame_path
-            else Path(__file__).resolve().parent.parent / "tmp" / "autosort_frame.jpg"
+            Path(frame_path) if frame_path else self.tmp_dir / "autosort_frame.jpg"
         )
+        self.detection_json_path = self.tmp_dir / "latest_detection.json"
         self.fallback_path = Path(__file__).resolve().parent / "fallback.png"
         self.trashcan_id = "🗑️ AutoSort System"
         self.trashcan_location = "Sorting bay / primary intake"
@@ -40,16 +43,21 @@ class AutoSortDashboard:
         if "recent_items" not in st.session_state:
             st.session_state.recent_items = list(self.recent_items)
 
-    @staticmethod
-    def _camera_available() -> bool:
-        for idx in range(6):
+    def _camera_available(self) -> bool:
+        if self.frame_path.exists():
+            try:
+                if time.time() - self.frame_path.stat().st_mtime < 3.0:
+                    return True
+            except Exception:
+                pass
+
+        for idx in range(2):
             cap = cv2.VideoCapture(idx)
-            if not cap.isOpened():
-                continue
-            ok, _ = cap.read()
-            cap.release()
-            if ok:
-                return True
+            if cap.isOpened():
+                ok, _ = cap.read()
+                cap.release()
+                if ok:
+                    return True
         return False
 
     @staticmethod
@@ -109,6 +117,15 @@ class AutoSortDashboard:
 
         return None
 
+    def _load_latest_detection(self) -> Dict[str, Any]:
+        if self.detection_json_path.exists():
+            try:
+                with open(self.detection_json_path, "r") as f:
+                    return json.load(f)
+            except Exception:
+                pass
+        return {"class": "None detected", "confidence": 0.0, "bin": "None", "timestamp": "N/A"}
+
     def sidebar(self):
         st.sidebar.markdown("# AutoSort Pages")
         page = st.sidebar.radio("Select Page:", ["Dashboard", "Statistics", "Information"])
@@ -139,12 +156,20 @@ class AutoSortDashboard:
                 col.warning(text)
 
     def render_camera_feed(self):
-        st.subheader("Live Feed")
+        st.subheader("Live Feed & AI Detections")
         frame = self._load_frame()
         if frame is not None:
             st.image(frame, use_container_width=True)
         else:
             st.info("No live frame available. Waiting for the vision pipeline...")
+
+        # Display Live Detection Readout
+        det = self._load_latest_detection()
+        st.markdown("### 🤖 Live AI Inference")
+        det_cols = st.columns(3)
+        det_cols[0].metric("Detected Class", det.get("class", "None"))
+        det_cols[1].metric("Confidence", f"{det.get('confidence', 0.0):.2f}")
+        det_cols[2].metric("Target Bin", det.get("bin", "None"))
 
     def render_bin_capacity(self):
         st.subheader("Bin Capacity")
@@ -178,11 +203,37 @@ class AutoSortDashboard:
             )
 
     def render_dev_console(self):
-        with st.expander("🛠️ Developer Console"):
+        with st.expander("🛠️ Developer Console & Telemetry"):
+            current_encoder_pos = "unknown"
+            try:
+                from hardware.servo_controller import ClosedLoopRotationController
+                ctrl = ClosedLoopRotationController()
+                current_encoder_pos = f"{ctrl.read_encoder_angle():.1f}°"
+                ctrl.close()
+            except Exception:
+                pass
+
             st.write("Latest camera frame:", self.frame_path)
-            st.write("Live detection output:", st.session_state.get("last_detection", {}))
-            st.write("Encoder position:", st.session_state.get("encoder_position", "unknown"))
+            st.write("Live detection output:", self._load_latest_detection())
+            st.write("Encoder position:", current_encoder_pos)
             st.write("Platform state:", st.session_state.get("platform_state", "idle"))
+
+            st.markdown("---")
+            st.subheader("Manual Rotation Test")
+            target_deg = st.slider("Target Heading (°)", 0.0, 360.0, 114.0, 1.0)
+            if st.button("Move Platform to Heading"):
+                with st.spinner(f"Rotating platform to {target_deg}°..."):
+                    try:
+                        from hardware.servo_controller import ClosedLoopRotationController
+                        ctrl = ClosedLoopRotationController()
+                        success = ctrl.move_to(target_deg)
+                        ctrl.close()
+                        if success:
+                            st.success(f"Successfully reached {target_deg}°!")
+                        else:
+                            st.warning("Motion completed, but angle verification was outside tolerance.")
+                    except Exception as e:
+                        st.error(f"Rotation error: {e}")
 
     def app(self):
         page = self.sidebar()
@@ -208,7 +259,7 @@ class AutoSortDashboard:
             st.code(
                 "AI model: vision_stuff/ai_model\n"
                 "Model labels: battery, compost, landfill, recycle\n"
-                "Rotation: turntable rotation to target bin\n"
+                "Rotation: turntable rotation to target bin via PID\n"
                 "Dispense: tilt selected slot, open gate, vibrate, close, reset"
             )
 
