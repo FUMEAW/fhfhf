@@ -76,20 +76,43 @@ class AutoSortSystem:
 
     CONFIDENCE_FLOOR = 0.45
 
-    def __init__(self, camera_index: Optional[int] = None, model_path: Optional[str] = None, frame_path: Optional[str] = None):
-        self.detector = YoloDetector(camera_index=camera_index, model_path=model_path, conf_threshold=self.CONFIDENCE_FLOOR)
+    def __init__(
+        self,
+        camera_index: Optional[int] = None,
+        model_path: Optional[str] = None,
+        frame_path: Optional[str] = None,
+    ):
+        self.detector = YoloDetector(
+            camera_index=camera_index,
+            model_path=model_path,
+            conf_threshold=self.CONFIDENCE_FLOOR,
+        )
         self.rotation = ClosedLoopRotationController()
         self.platform = PlatformController()
         self.bridge = BridgeRPC(self.rotation, self.platform)
-        self.frame_path = Path(frame_path) if frame_path else Path(__file__).resolve().parent.parent / "tmp" / "autosort_frame.jpg"
+        self.frame_path = (
+            Path(frame_path)
+            if frame_path
+            else Path(__file__).resolve().parent.parent / "tmp" / "autosort_frame.jpg"
+        )
         self.frame_path.parent.mkdir(parents=True, exist_ok=True)
         self.hardware_status = HardwareStatus()
 
     def refresh_hardware_status(self) -> HardwareStatus:
-        camera_index = self.detector.camera_index if self.detector.camera_index is not None else self.detector.find_camera_index()
+        camera_index = (
+            self.detector.camera_index
+            if self.detector.camera_index is not None
+            else self.detector.find_camera_index()
+        )
         camera_available = bool(camera_index is not None and self.detector.camera_available)
-        encoder_available = bool(getattr(self.rotation, "encoder_available", False) or getattr(self.rotation.servo, "encoder_available", False))
-        platform_available = bool(getattr(self.platform.controller, "available", False) or getattr(self.platform.controller, "pwm", None) is not None)
+        encoder_available = bool(
+            getattr(self.rotation, "encoder_available", False)
+            or getattr(self.rotation.servo, "encoder_available", False)
+        )
+        platform_available = bool(
+            getattr(self.platform.controller, "available", False)
+            or getattr(self.platform.controller, "pwm", None) is not None
+        )
 
         warnings: list[str] = []
         if not camera_available:
@@ -112,7 +135,6 @@ class AutoSortSystem:
         detections = self.detector.get_detections()
         if not detections:
             return None
-
         best = max(detections, key=lambda item: item.confidence)
         if best.confidence < self.CONFIDENCE_FLOOR:
             return None
@@ -143,12 +165,10 @@ class AutoSortSystem:
     def make_sort_action(self, detection: DetectionResult) -> Optional[SortAction]:
         if detection is None:
             return None
-
         label = detection.label or "unknown"
         bin_name = self._resolve_bin(label)
         slot = self._slot_for_bin(bin_name)
         door_id = self._door_for_slot(slot)
-
         return SortAction(
             label=label,
             bin_name=bin_name,
@@ -159,16 +179,20 @@ class AutoSortSystem:
         )
 
     def run_sort_cycle(self, detection: Optional[DetectionResult]) -> Optional[SortAction]:
-        if detection is None:
-            return None
+        """Execute a full sort cycle for a given detection.
 
-        if not self.refresh_hardware_status().camera_available:
+        Camera availability is checked at classify time, not here — a detection
+        that already succeeded should not be blocked by a transient camera check.
+        """
+        if detection is None:
             return None
 
         action = self.make_sort_action(detection)
         if action is None:
             return None
 
+        # Only skip if the physical platform hardware is genuinely offline
+        self.refresh_hardware_status()
         if not self.hardware_status.platform_available:
             return None
 
@@ -180,10 +204,13 @@ class AutoSortSystem:
             self.detector.start()
         except RuntimeError:
             self.detector._running = False
+
         self.refresh_hardware_status()
+
         if self.hardware_status.encoder_available:
             self.rotation.set_zero()
-            self.rotation.set_motion_range()
+            # Explicitly set the full safe arc — no implicit defaults
+            self.rotation.set_motion_range(114.0, 229.0)
         else:
             self.rotation.current_angle_deg = 0.0
             self.rotation.target_deg = 0.0

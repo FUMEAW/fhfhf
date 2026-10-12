@@ -19,9 +19,9 @@ class ServoController:
     """General-purpose PCA9685 servo controller for standard servos."""
 
     SERVO_FREQ = 50
-    SERVO_MIN = 102     # Calibrated safe pulse floor (ticks)
-    SERVO_MAX = 512     # Calibrated safe pulse ceiling (ticks)
-    SERVO_ZERO = 307    # Default 0-degree reference (ticks, 90° physical)
+    SERVO_MIN = 102
+    SERVO_MAX = 512
+    SERVO_ZERO = 307
 
     def __init__(self, address=PCA9685_ADDRESS, bus=SERVO_I2C_BUS):
         self.ticks_per_degree = (self.SERVO_MAX - self.SERVO_MIN) / 180.0
@@ -56,8 +56,9 @@ class ServoController:
         slots: list,
         amplitude_deg: float = 6.0,
         duration_sec: float = 1.0,
-        interval_sec: float = 0.020
+        interval_sec: float = 0.020,
     ):
+        """Symmetrical vibration routine across multiple servo channels."""
         base_positions = {s: self.current_angles.get(s, 0.0) for s in slots}
         start_time = time.time()
         toggle = True
@@ -137,7 +138,7 @@ class Servo3Controller:
             return self.last_good_angle if self.last_good_angle is not None else 114.0
 
     def set_servo_pwm(self, angle_deg: float):
-        """Write a servo angle to PCA9685 channel 3."""
+        """Write a servo angle to PCA9685 channel 3, clamped to safe range."""
         if self.pwm is None:
             return
         target = max(114.0, min(229.0, float(angle_deg)))
@@ -180,8 +181,13 @@ class Servo3Controller:
 
 class ContinuousRotationServoController:
     """
-    Closed-loop PID control for a continuous rotation servo on PCA9685 channel 3
-    using the standard Python `simple_pid` library combined with the custom loopback error function.
+    Closed-loop PID control for the continuous rotation servo on PCA9685 channel 3.
+
+    Physical limits: the safe encoder arc runs from 114° (CW end) to 229° (CCW end).
+    The servo must NEVER travel CCW from 229° back toward 114° directly — that path
+    crosses a physical hard stop. All return travel must go CW through 360°/0°.
+
+    PID setpoint is fixed at 0.0; we feed -error so the output drives error to zero.
     """
 
     PCA9685_ADDRESS = PCA9685_ADDRESS
@@ -190,12 +196,14 @@ class ContinuousRotationServoController:
     NEUTRAL_PULSE = 307
     PULSE_SPAN = 110
 
-    ENCODER_MIN = 114.0
-    ENCODER_MAX = 229.0
+    ENCODER_MIN = 114.0    # CW physical limit
+    ENCODER_MAX = 229.0    # CCW physical limit
     ENCODER_RANGE = ENCODER_MAX - ENCODER_MIN
 
-    FORBIDDEN_CCW_START = 230.0
-    FORBIDDEN_CCW_END = 90.0
+    # Any CCW path that would cross from >= FORBIDDEN_CCW_START to
+    # below FORBIDDEN_CCW_START is rerouted CW through 360°/0°.
+    FORBIDDEN_CCW_START = 229.0
+    FORBIDDEN_CCW_END = 114.0
 
     def __init__(
         self,
@@ -233,36 +241,41 @@ class ContinuousRotationServoController:
             self.encoder_bus = None
             self.encoder_available = False
 
-        # Setpoint = 0.0. We feed -error into self.pid() to prevent control inversion.
+        # Setpoint = 0.0. We feed -error into pid() to drive error to zero.
         self.pid = PID(Kp=kp, Ki=ki, Kd=kd, setpoint=0.0, output_limits=(-1.0, 1.0))
         self.target_normalized = 0.0
         self.current_speed = 0.0
 
     def _safe_error(self, current_deg: float, target_deg: float) -> float:
         """
-        Loopback / safety function: compute signed error that routes correctly 
-        through boundaries and avoids forbidden regions.
+        Compute signed error that always routes CW through the safe zone
+        (229 -> 360 -> 0 -> 114) and never CCW through the forbidden zone (229 -> 114 directly).
+
+        Positive error = CW movement needed.
+        Negative error = CCW movement needed (only valid within 114-229 arc).
         """
         current = current_deg % 360.0
         target = target_deg % 360.0
 
+        # Shortest-path signed error
         error = target - current
         if error > 180:
             error -= 360
         elif error < -180:
             error += 360
 
+        # If CCW movement requested, check whether it would cross the forbidden zone.
+        # Forbidden: CCW from >= FORBIDDEN_CCW_START down to < FORBIDDEN_CCW_START.
         if error < 0:
             ccw_destination = (current + error) % 360.0
-            if current >= self.FORBIDDEN_CCW_START and ccw_destination <= self.FORBIDDEN_CCW_END:
-                error = 360.0 + error
-            elif current >= self.FORBIDDEN_CCW_START and ccw_destination < current:
+            if current >= self.FORBIDDEN_CCW_START and ccw_destination < self.FORBIDDEN_CCW_START:
+                # Path crosses the physical stop — reroute CW
                 error = 360.0 + error
 
         return error
 
     def refresh_encoder(self) -> bool:
-        """Re-open encoder connection if lost."""
+        """Re-open encoder connection if lost. Returns True if available."""
         if self.encoder_available and self.encoder_bus is not None:
             return True
         try:
@@ -326,10 +339,12 @@ class ContinuousRotationServoController:
         self,
         target_normalized: float = 0.0,
         duration_sec: float = 3.0,
-        update_hz: float = 20.0
+        update_hz: float = 20.0,
     ) -> dict:
         """
-        Spin servo to a normalized target position using closed-loop PID and loopback.
+        Spin servo to a normalized target position using closed-loop PID.
+        Respects the physical hard stop — always routes CW through 360°/0° when
+        going from high encoder angles back to low ones.
         Returns a dict with final position and per-step samples.
         """
         start = time.monotonic()
@@ -342,7 +357,7 @@ class ContinuousRotationServoController:
             current_norm = self.degrees_to_normalized(current_deg)
             error = self._safe_error(current_deg, target_deg)
 
-            # Pass -error into PID library to match setpoint=0 calculation correctly
+            # Pass -error: PID setpoint=0, so pid(-error) drives error toward zero
             command = self.pid(-error)
 
             if abs(error) <= 0.5:
@@ -355,7 +370,7 @@ class ContinuousRotationServoController:
                 "angle_deg": round(current_deg, 2),
                 "normalized_pos": round(current_norm, 3),
                 "error_deg": round(error, 2),
-                "command": round(command, 3)
+                "command": round(command, 3),
             })
 
             if abs(error) <= 0.5:
@@ -377,19 +392,15 @@ class ContinuousRotationServoController:
         """Start a background PID loop holding a normalized target position."""
         self.set_target_normalized(target_normalized)
         self._stop_event.clear()
-        target_deg = self.normalized_to_degrees(self.target_normalized)
 
         def _loop():
-            nonlocal target_deg
             while not self._stop_event.is_set():
                 target_deg = self.normalized_to_degrees(self.target_normalized)
                 current_deg = self.read_encoder_angle()
                 error = self._safe_error(current_deg, target_deg)
                 command = self.pid(-error)
-
                 if abs(error) <= 0.5:
                     command = 0.0
-
                 self.set_speed(command)
                 time.sleep(0.02)
             self.set_speed(0.0)
@@ -453,6 +464,7 @@ class ClosedLoopRotationController:
         return self.encoder_available
 
     def set_zero(self, zero_deg: float = None) -> float:
+        """Set encoder zero point. Omit argument to use current encoder reading."""
         self._refresh()
         if zero_deg is None:
             zero_deg = self.read_encoder_angle()
@@ -460,6 +472,7 @@ class ClosedLoopRotationController:
         return self.zero_offset_deg
 
     def set_motion_range(self, min_deg: float = None, max_deg: float = None) -> None:
+        """Set the usable encoder arc. Defaults to ENCODER_MIN/MAX."""
         self.motion_min_deg = self.cont.ENCODER_MIN if min_deg is None else float(min_deg)
         self.motion_max_deg = self.cont.ENCODER_MAX if max_deg is None else float(max_deg)
 
@@ -486,8 +499,8 @@ class ClosedLoopRotationController:
         return abs(result["final_angle_deg"] - result["target_deg"]) <= self.tolerance_deg
 
     def move_to(self, target_deg: float, timeout: float = 8.0, step_delay: float = 0.05) -> bool:
-        """Move to a heading in degrees using continuous-servo PID (speed), not position PWM."""
-        del step_delay
+        """Move to a heading in degrees using continuous-servo PID (speed)."""
+        del step_delay  # not used — speed is controlled by PID
         encoder_target = self.heading_to_encoder(target_deg)
         normalized = self.cont.degrees_to_normalized(encoder_target)
         return self.move_to_normalized(normalized, timeout=timeout)

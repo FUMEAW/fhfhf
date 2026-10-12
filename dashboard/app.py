@@ -17,7 +17,11 @@ from PIL import Image
 
 class AutoSortDashboard:
     def __init__(self, frame_path: str | Path | None = None):
-        self.frame_path = Path(frame_path) if frame_path else Path(__file__).resolve().parent.parent / "tmp" / "autosort_frame.jpg"
+        self.frame_path = (
+            Path(frame_path)
+            if frame_path
+            else Path(__file__).resolve().parent.parent / "tmp" / "autosort_frame.jpg"
+        )
         self.fallback_path = Path(__file__).resolve().parent / "fallback.png"
         self.trashcan_id = "🗑️ AutoSort System"
         self.trashcan_location = "Sorting bay / primary intake"
@@ -52,7 +56,6 @@ class AutoSortDashboard:
     def _encoder_available() -> bool:
         try:
             import smbus2
-
             for bus in (1, 4, 5, 13, 14):
                 try:
                     bus_obj = smbus2.SMBus(bus)
@@ -73,7 +76,6 @@ class AutoSortDashboard:
     def _platform_available() -> bool:
         try:
             import smbus2
-
             for bus in (1, 4, 5, 13, 14):
                 try:
                     bus_obj = smbus2.SMBus(bus)
@@ -146,9 +148,16 @@ class AutoSortDashboard:
 
     def render_bin_capacity(self):
         st.subheader("Bin Capacity")
+        bin_colors = {
+            "Recycling": "🟢",
+            "Battery": "🔴",
+            "Compost": "🟤",
+            "Landfill": "⚫",
+        }
         for label, fill in self.bin_data.items():
             fill_ratio = max(0.0, min(float(fill), 1.0))
-            st.markdown(f"**{label}**")
+            icon = bin_colors.get(label, "⬜")
+            st.markdown(f"**{icon} {label}**")
             st.progress(fill_ratio)
             st.caption(f"{fill_ratio * 100:.0f}% full")
 
@@ -159,9 +168,13 @@ class AutoSortDashboard:
             st.caption("No sorted items yet.")
             return
 
-        for item in items[-10:]:
+        for item in reversed(items[-10:]):
+            conf = item.get("confidence", 0.0)
+            label = item.get("class", "unknown")
+            timestamp = item.get("timestamp", "unknown")
+            bin_name = item.get("bin", "unknown")
             st.markdown(
-                f"- **{item.get('class', 'unknown')}** • {item.get('confidence', 0.0):.2f} • {item.get('timestamp', 'unknown')} • bin: {item.get('bin', 'unknown')}"
+                f"- **{label}** &nbsp;·&nbsp; {conf:.2f} conf &nbsp;·&nbsp; {bin_name} &nbsp;·&nbsp; `{timestamp}`"
             )
 
     def render_dev_console(self):
@@ -199,61 +212,7 @@ class AutoSortDashboard:
                 "Dispense: tilt selected slot, open gate, vibrate, close, reset"
             )
 
-    def render_camera_feed(self):
-        frame = self._load_frame()
-        if frame is not None:
-            st.image(frame, use_container_width=True)
-        else:
-            st.info("No live frame available. Waiting for the vision pipeline...")
-
-    def render_bin_capacity(self):
-        st.subheader("Bin Capacity")
-        for label, fill in self.bin_data.items():
-            fill_ratio = max(0.0, min(float(fill), 1.0))
-            st.markdown(f"**{label}**")
-            st.progress(fill_ratio)
-            st.caption(f"{fill_ratio * 100:.0f}% full")
-
-    def render_recent_items(self):
-        st.subheader("Recently Disposed Items")
-        items = st.session_state.get("recent_items", [])
-        if not items:
-            st.caption("No sorted items yet.")
-            return
-
-        for item in items[-10:]:
-            st.markdown(
-                f"- {item.get('class', 'unknown')} • {item.get('confidence', 0.0):.2f} • {item.get('timestamp', 'unknown')} • bin: {item.get('bin', 'unknown')}"
-            )
-
-    def render_dev_console(self):
-        with st.expander("🛠️ Developer Console"):
-            st.write("Latest camera frame:", self.frame_path)
-            st.write("Live detection output:", st.session_state.get("last_detection", {}))
-            st.write("Encoder position:", st.session_state.get("encoder_position", "unknown"))
-            st.write("Platform state:", st.session_state.get("platform_state", "idle"))
-
-    def app(self):
-        page = self.sidebar()
-        if page == "Dashboard":
-            self.render_header()
-            self.render_system_status()
-            left_col, right_col = st.columns([1.2, 0.8])
-            with left_col:
-                self.render_camera_feed()
-            with right_col:
-                self.render_bin_capacity()
-                self.render_recent_items()
-            self.render_dev_console()
-        elif page == "Statistics":
-            st.title("Statistics")
-            st.write("Historical fill rates and throughput metrics can be shown here.")
-        elif page == "Information":
-            st.title("Information")
-            st.write("System health, calibration notes, and installation details live here.")
-
 
 if __name__ == "__main__":
     app = AutoSortDashboard()
     app.app()
-

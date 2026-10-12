@@ -13,11 +13,14 @@ class PlatformCommand:
         self.platform = PlatformController()
         self.detector = YoloDetector(camera_index=None)
 
+        # Degrade gracefully if encoder is missing rather than crashing at startup
         if not self.rotation.encoder_available:
-            raise RuntimeError("AS5600 encoder not found on I2C bus 4")
-
+            print("WARNING: AS5600 encoder not found on I2C bus. Rotation will be open-loop.")
+        
         self.platform.level_platform()
-        self.rotation.move_to(0.0)
+        
+        if self.rotation.encoder_available:
+            self.rotation.move_to(0.0)
 
     def operate_platform(self):
         self.detector.start()
@@ -47,7 +50,9 @@ class PlatformCommand:
                 print(f"Ignoring invalid detection: slot={slot}, material={material}")
                 continue
 
-            self.rotation.move_to(BIN_ANGLES[bin_name])
+            if self.rotation.encoder_available:
+                self.rotation.move_to(BIN_ANGLES[bin_name])
             self.platform.expel_item(slot)
-            self.rotation.move_to(0.0)
+            if self.rotation.encoder_available:
+                self.rotation.move_to(0.0)
             self.platform.level_platform()

@@ -45,7 +45,14 @@ class DetectionResult:
 class YoloDetector:
     def __init__(self, camera_index: Optional[int] = 0, model_path: Optional[str] = None, conf_threshold: float = 0.45):
         base_dir = Path(__file__).resolve().parent.parent
-        default_model = base_dir / "vision_stuff" / "ai_model" / "weights.onnx"
+        # Try common model file names in order of preference
+        for candidate in ("weights.onnx", "best.onnx", "model.onnx", "model.pt", "best.pt"):
+            candidate_path = base_dir / "vision_stuff" / "ai_model" / candidate
+            if candidate_path.exists():
+                default_model = candidate_path
+                break
+        else:
+            default_model = base_dir / "vision_stuff" / "ai_model" / "weights.onnx"  # will fail clearly if missing
         self.model_path = Path(model_path) if model_path else default_model
         self.camera_index = camera_index
         self.conf_threshold = conf_threshold
