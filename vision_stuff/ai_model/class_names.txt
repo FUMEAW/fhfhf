@@ -1,0 +1,5 @@
+background_class83422
+battery
+compost
+landfill
+recycle

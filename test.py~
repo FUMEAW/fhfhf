@@ -1,0 +1,7 @@
+from hardware.servo_controller import ServoController
+from hardware.as5600_motor_pid import Motor_control
+import hardware.platform_control as pc
+import time
+
+cont = ServoController()
+cont.set_servo_angle(0,0)
