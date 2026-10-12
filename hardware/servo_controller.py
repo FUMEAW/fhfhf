@@ -5,6 +5,15 @@ from adafruit_pca9685 import PCA9685
 from adafruit_extended_bus import ExtendedI2C
 from simple_pid import PID
 
+from hardware.config import (
+    AS5600_ADDRESS,
+    AS5600_ANGLE_REGISTER,
+    AS5600_I2C_BUS,
+    CONTINUOUS_SERVO_CHANNEL,
+    PCA9685_ADDRESS,
+    SERVO_I2C_BUS,
+)
+
 
 class ServoController:
     """General-purpose PCA9685 servo controller for standard servos."""
@@ -14,21 +23,23 @@ class ServoController:
     SERVO_MAX = 512     # Calibrated safe pulse ceiling (ticks)
     SERVO_ZERO = 307    # Default 0-degree reference (ticks, 90° physical)
 
-    def __init__(self, address=0x40, bus=1):
+    def __init__(self, address=PCA9685_ADDRESS, bus=SERVO_I2C_BUS):
         self.ticks_per_degree = (self.SERVO_MAX - self.SERVO_MIN) / 180.0
         self.address = address
         self.available = False
         self.current_angles = {}
+        self.init_error = None
 
         try:
             self.i2c = ExtendedI2C(bus)
             self.pwm = PCA9685(self.i2c, address=address)
             self.pwm.frequency = self.SERVO_FREQ
             self.available = True
-        except Exception:
+        except Exception as exc:
             self.i2c = None
             self.pwm = None
             self.available = False
+            self.init_error = exc
 
     def set_servo_angle(self, slot: int, angle_deg: float):
         """Set target angle for a specific PCA9685 channel."""
@@ -70,12 +81,12 @@ class ServoController:
 class Servo3Controller:
     """Servo on PCA9685 channel 3 with AS5600 magnetic encoder feedback."""
 
-    SERVO_CHANNEL = 3
-    PCA9685_ADDRESS = 0x40
-    AS5600_ADDRESS = 0x36
-    AS5600_ANGLE_REGISTER = 0x0E
+    SERVO_CHANNEL = CONTINUOUS_SERVO_CHANNEL
+    PCA9685_ADDRESS = PCA9685_ADDRESS
+    AS5600_ADDRESS = AS5600_ADDRESS
+    AS5600_ANGLE_REGISTER = AS5600_ANGLE_REGISTER
 
-    def __init__(self, servo_bus=1, as5600_bus=4):
+    def __init__(self, servo_bus=SERVO_I2C_BUS, as5600_bus=AS5600_I2C_BUS):
         self.servo_bus = servo_bus
         self.as5600_bus_id = as5600_bus
         self.encoder_available = False
@@ -173,9 +184,9 @@ class ContinuousRotationServoController:
     using the standard Python `simple_pid` library combined with the custom loopback error function.
     """
 
-    PCA9685_ADDRESS = 0x40
-    AS5600_ADDRESS = 0x36
-    AS5600_ANGLE_REGISTER = 0x0E
+    PCA9685_ADDRESS = PCA9685_ADDRESS
+    AS5600_ADDRESS = AS5600_ADDRESS
+    AS5600_ANGLE_REGISTER = AS5600_ANGLE_REGISTER
     NEUTRAL_PULSE = 307
     PULSE_SPAN = 110
 
@@ -186,7 +197,15 @@ class ContinuousRotationServoController:
     FORBIDDEN_CCW_START = 230.0
     FORBIDDEN_CCW_END = 90.0
 
-    def __init__(self, servo_bus=1, as5600_bus=4, servo_channel=3, kp=0.8, ki=0.0, kd=0.3):
+    def __init__(
+        self,
+        servo_bus=SERVO_I2C_BUS,
+        as5600_bus=AS5600_I2C_BUS,
+        servo_channel=CONTINUOUS_SERVO_CHANNEL,
+        kp=0.8,
+        ki=0.0,
+        kd=0.3,
+    ):
         self.servo_bus = servo_bus
         self.as5600_bus_id = as5600_bus
         self.servo_channel = servo_channel
@@ -402,87 +421,82 @@ class ContinuousRotationServoController:
 
 
 class ClosedLoopRotationController:
-    """
-    High-level closed-loop rotation controller using AS5600 feedback.
-    Supports runtime zero calibration and configurable motion range.
+    """Yaw the platform with the continuous-rotation servo on PCA9685 channel 3.
+
+    PWM on a continuous servo is speed, not position. This wrapper converts a
+    heading (0-360) into the AS5600 encoder arc and runs the PID speed loop.
     """
 
-    def __init__(self, servo_bus=1, as5600_bus=4, servo_channel=3):
-        self.servo = Servo3Controller(servo_bus=servo_bus, as5600_bus=as5600_bus)
+    def __init__(
+        self,
+        servo_bus=SERVO_I2C_BUS,
+        as5600_bus=AS5600_I2C_BUS,
+        servo_channel=CONTINUOUS_SERVO_CHANNEL,
+    ):
+        self.cont = ContinuousRotationServoController(
+            servo_bus=servo_bus,
+            as5600_bus=as5600_bus,
+            servo_channel=servo_channel,
+        )
+        self.servo = self.cont
         self.servo_channel = servo_channel
         self.zero_offset_deg = 0.0
-        self.motion_min_deg = 114.0
-        self.motion_max_deg = 229.0
-        self.target_deg = 114.0
+        self.motion_min_deg = self.cont.ENCODER_MIN
+        self.motion_max_deg = self.cont.ENCODER_MAX
+        self.target_deg = self.cont.ENCODER_MIN
         self.tolerance_deg = 1.0
-        self.max_step_deg = 25.0
-        self.current_angle_deg = 114.0
-        self.encoder_available = self.servo.encoder_available
+        self.current_angle_deg = self.cont.ENCODER_MIN
+        self.encoder_available = self.cont.encoder_available
 
-    @staticmethod
-    def _wrap_degrees(value_deg: float) -> float:
-        return ((value_deg + 180.0) % 360.0) - 180.0
+    def _refresh(self) -> bool:
+        self.encoder_available = self.cont.refresh_encoder()
+        return self.encoder_available
 
     def set_zero(self, zero_deg: float = None) -> float:
-        """
-        Set encoder zero point. Pass a value to set manually,
-        or leave None to use the current encoder reading as zero.
-        """
+        self._refresh()
         if zero_deg is None:
             zero_deg = self.read_encoder_angle()
         self.zero_offset_deg = float(zero_deg)
-        self.encoder_available = self.servo.encoder_available
         return self.zero_offset_deg
 
-    def set_motion_range(self, min_deg: float = 114.0, max_deg: float = 229.0) -> None:
-        """Set the usable motion range in degrees."""
-        self.motion_min_deg = float(min_deg)
-        self.motion_max_deg = float(max_deg)
-        self.target_deg = self._clamp_target(self.target_deg)
+    def set_motion_range(self, min_deg: float = None, max_deg: float = None) -> None:
+        self.motion_min_deg = self.cont.ENCODER_MIN if min_deg is None else float(min_deg)
+        self.motion_max_deg = self.cont.ENCODER_MAX if max_deg is None else float(max_deg)
 
     def read_encoder_angle(self) -> float:
-        return float(self.servo.read_as5600_angle())
+        self._refresh()
+        return float(self.cont.read_encoder_angle())
 
-    def _clamp_target(self, target_deg: float) -> float:
-        target_deg = float(target_deg)
-        low = min(self.motion_min_deg, self.motion_max_deg)
-        high = max(self.motion_min_deg, self.motion_max_deg)
-        return min(max(target_deg, low), high)
+    def heading_to_encoder(self, heading_deg: float) -> float:
+        """Map a 0-360 bin heading onto the allowed encoder arc."""
+        span = self.motion_max_deg - self.motion_min_deg
+        t = (float(heading_deg) % 360.0) / 360.0
+        return self.motion_min_deg + t * span
 
-    def _error_to_target(self, target_deg: float, current_deg: float) -> float:
-        return self._wrap_degrees(target_deg - current_deg)
-
-    def move_to(self, target_deg: float, timeout: float = 8.0, step_delay: float = 0.05) -> bool:
-        """Move to a target angle in degrees, respecting zero offset and motion range."""
-        self.encoder_available = self.servo.encoder_available
-        self.target_deg = self._clamp_target(float(target_deg))
-
+    def move_to_normalized(self, normalized: float, timeout: float = 8.0) -> bool:
+        self._refresh()
         if not self.encoder_available:
             return False
+        result = self.cont.spin_to_target(
+            target_normalized=max(0.0, min(1.0, float(normalized))),
+            duration_sec=timeout,
+        )
+        self.current_angle_deg = result["final_angle_deg"]
+        self.target_deg = result["target_deg"]
+        return abs(result["final_angle_deg"] - result["target_deg"]) <= self.tolerance_deg
 
-        deadline = time.monotonic() + timeout
-        while time.monotonic() < deadline:
-            current = self.read_encoder_angle() - self.zero_offset_deg
-            error = self._error_to_target(self.target_deg, current)
-
-            if abs(error) <= self.tolerance_deg:
-                self.servo.set_servo_pwm(self.target_deg)
-                self.current_angle_deg = current
-                return True
-
-            command = current + max(-self.max_step_deg, min(self.max_step_deg, error * 0.8))
-            self.servo.set_servo_pwm(command)
-            self.current_angle_deg = current
-            time.sleep(step_delay)
-
-        self.servo.set_servo_pwm(self.target_deg)
-        return False
+    def move_to(self, target_deg: float, timeout: float = 8.0, step_delay: float = 0.05) -> bool:
+        """Move to a heading in degrees using continuous-servo PID (speed), not position PWM."""
+        del step_delay
+        encoder_target = self.heading_to_encoder(target_deg)
+        normalized = self.cont.degrees_to_normalized(encoder_target)
+        return self.move_to_normalized(normalized, timeout=timeout)
 
     def stop(self) -> None:
-        self.servo.set_servo_pwm(self.current_angle_deg)
+        self.cont.stop()
 
     def close(self):
-        self.servo.close()
+        self.cont.close()
 
 
 # Backward-compatible aliases

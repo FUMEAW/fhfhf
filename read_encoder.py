@@ -3,14 +3,15 @@
 
 import sys
 import time
+from hardware.config import AS5600_I2C_BUS
 from hardware.servo_controller import Servo3Controller, ContinuousRotationServoController
 
 def main():
-    servo = Servo3Controller(servo_bus=1, as5600_bus=4)
-    cont = ContinuousRotationServoController(servo_bus=1, as5600_bus=4, servo_channel=3)
+    servo = Servo3Controller()
+    cont = ContinuousRotationServoController()
     
     if not servo.encoder_available:
-        print("AS5600 encoder not found on bus 4")
+        print(f"AS5600 encoder not found on bus {AS5600_I2C_BUS}")
         sys.exit(1)
     
     # Single read

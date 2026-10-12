@@ -1,48 +1,53 @@
 import time
 
-from hardware.servo_controller import ServoController
-from kinematics.stewart_ik import StewartPlatformIK
-from hardware.as5600_motor_pid import Motor_control 
-import vision_stuff.vision as vision
+from autosort.config import BIN_ANGLES, LABEL_ALIASES, SLOT_MAP, SORTING_RULES
+from hardware.platform_control import PlatformController
+from hardware.servo_controller import ClosedLoopRotationController
+from vision_stuff.vision import YoloDetector
 
-bin_positions = {"CARDBOARD": 315, "GLASS": 315, "METAL": 315, "PAPER": 315, "BIODEGRADABLE": 135, "PLASTIC": 225}
-plat_positions = {1: -45, 2: 45, 3: -135, 4: 135}
+
 class PlatformCommand:
-    offset = Motor_control.offset
-    def __init__(self, camera_image):
-        self.pid = Motor_control()
+    def __init__(self, camera_image=None):
         self.file = camera_image
-        self.servocontrol = ServoController()
-        self.plat_ik = StewartPlatformIK(self.servocontrol)
+        self.rotation = ClosedLoopRotationController()
+        self.platform = PlatformController()
+        self.detector = YoloDetector(camera_index=None)
 
-        self.plat_ik.level_platform()
+        if not self.rotation.encoder_available:
+            raise RuntimeError("AS5600 encoder not found on I2C bus 4")
 
-        self.pid.run_pid()
-        # TODO: change self.offset after testing. self.offset is hardware offset from what 0 should be
+        self.platform.level_platform()
+        self.rotation.move_to(0.0)
+
     def operate_platform(self):
-        results = vision.results(self.file)
-        if not isinstance(results, dict):
-            print(f"Vision failed: {results}")
+        self.detector.start()
+        try:
+            deadline = time.monotonic() + 2.0
+            detections = []
+            while time.monotonic() < deadline:
+                detections = self.detector.get_detections()
+                if detections:
+                    break
+                time.sleep(0.05)
+        finally:
+            self.detector.stop()
+
+        if not detections:
+            print("Vision failed: no detections")
             return
 
-        for slot, material in results.items():
-            if slot not in plat_positions or material not in bin_positions:
+        for det in detections:
+            material = (det.label or "").lower().strip()
+            mapped = LABEL_ALIASES.get(material, material)
+            if mapped is None:
+                continue
+            bin_name = SORTING_RULES.get(mapped, mapped)
+            slot = det.slot_num or SLOT_MAP.get(bin_name)
+            if slot is None or bin_name not in BIN_ANGLES:
                 print(f"Ignoring invalid detection: slot={slot}, material={material}")
                 continue
 
-            self.pid.set_setpoint(
-                bin_positions[material] + plat_positions[slot] + self.offset
-            )
-            self._wait_for_target()
-            self.plat_ik.tilt_slot(slot - 1)
-
-            self.pid.set_setpoint(self.offset)
-            self._wait_for_target()
-            self.plat_ik.level_platform()
-
-    def _wait_for_target(self, timeout=30.0):
-        deadline = time.monotonic() + timeout
-        while not self.pid.target_reached():
-            if time.monotonic() >= deadline:
-                raise TimeoutError("Motor did not reach its target in time")
-            time.sleep(0.01)
+            self.rotation.move_to(BIN_ANGLES[bin_name])
+            self.platform.expel_item(slot)
+            self.rotation.move_to(0.0)
+            self.platform.level_platform()

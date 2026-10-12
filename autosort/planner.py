@@ -183,7 +183,7 @@ class AutoSortSystem:
         self.refresh_hardware_status()
         if self.hardware_status.encoder_available:
             self.rotation.set_zero()
-            self.rotation.set_motion_range(-180.0, 180.0)
+            self.rotation.set_motion_range()
         else:
             self.rotation.current_angle_deg = 0.0
             self.rotation.target_deg = 0.0

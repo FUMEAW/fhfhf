@@ -1,3 +1,11 @@
+"""Retired DC motor + encoder PID.
+
+Yaw is now the continuous-rotation servo on PCA9685 channel 3
+(`hardware.servo_controller.ContinuousRotationServoController`).
+This module is kept only for reference and should not be imported by
+runtime control paths.
+"""
+
 import smbus2
 import atexit
 import threading

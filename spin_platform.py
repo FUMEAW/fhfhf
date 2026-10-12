@@ -3,6 +3,7 @@
 
 import sys
 import argparse
+from hardware.config import AS5600_I2C_BUS, CONTINUOUS_SERVO_CHANNEL, SERVO_I2C_BUS
 from hardware.servo_controller import ContinuousRotationServoController
 
 
@@ -35,15 +36,19 @@ def main():
     duration = max(0.1, args.duration)
     
     print(f"Initializing platform controller...")
-    cont = ContinuousRotationServoController(servo_bus=1, as5600_bus=4, servo_channel=3)
+    cont = ContinuousRotationServoController(
+        servo_bus=SERVO_I2C_BUS,
+        as5600_bus=AS5600_I2C_BUS,
+        servo_channel=CONTINUOUS_SERVO_CHANNEL,
+    )
     
     if not cont.servo_available:
-        print("ERROR: PCA9685 servo controller not found on bus 1")
+        print(f"ERROR: PCA9685 servo controller not found on bus {SERVO_I2C_BUS}")
         sys.exit(1)
     
     print(f"Refreshing encoder connection...")
     if not cont.refresh_encoder():
-        print("ERROR: AS5600 encoder not found on bus 4")
+        print(f"ERROR: AS5600 encoder not found on bus {AS5600_I2C_BUS}")
         sys.exit(1)
     
     print(f"\nSpinning to position {position:.2f} (0-1) = {cont.normalized_to_degrees(position):.2f}°")

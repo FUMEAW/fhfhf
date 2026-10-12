@@ -1,48 +1,76 @@
-import board
-import adafruit_tca9548a
-import time
-import adafruit_vl53l0x
-import neopixel
-from gpiozero import DistanceSensor
-import busio
-import smbus2
-from adafruit_extended_bus import ExtendedI2C
 import statistics
 
-# Initialize the built-in NeoPixel RGB LEDs (6 total, 3 in each barrel)
-# GPIO 18 (board.D18) is ideal for hardware PWM control
-LED_COUNT = 6
-pixels = neopixel.NeoPixel(board.D18, LED_COUNT, brightness=0.5, auto_write=False)
-ultra_sensor = DistanceSensor(echo=24, trigger=23, max_distance=4.0)
+from hardware.config import (
+    LED_COUNT,
+    NEOPIXEL_PIN,
+    TCA9548A_I2C_BUS,
+    ULTRASONIC_ECHO,
+    ULTRASONIC_TRIGGER,
+)
 
-# CHANGE THIS to the exact digit you found at the end of 'ls /dev/i2c*' to use bitbang
-# /dev/i2c-13
-MY_ASSIGNED_BUS = 5  
-i2c = ExtendedI2C(MY_ASSIGNED_BUS)
-multiplex = adafruit_tca9548a.TCA9548A(i2c)
-
-# Tune this value after all the electronics are put together
 empty_height = 287
 
-# Used to determine bin fullness for all bins but battery bin
+_pixels = None
+_ultra_sensor = None
+_multiplex = None
+_tof_sensors = {}
+
+
+def _get_pixels():
+    global _pixels
+    if _pixels is None:
+        import board
+        import neopixel
+
+        pin = getattr(board, f"D{NEOPIXEL_PIN}")
+        _pixels = neopixel.NeoPixel(pin, LED_COUNT, brightness=0.5, auto_write=False)
+    return _pixels
+
+
+def _get_ultra():
+    global _ultra_sensor
+    if _ultra_sensor is None:
+        from gpiozero import DistanceSensor
+
+        _ultra_sensor = DistanceSensor(
+            echo=ULTRASONIC_ECHO, trigger=ULTRASONIC_TRIGGER, max_distance=4.0
+        )
+    return _ultra_sensor
+
+
+def _get_mux():
+    global _multiplex
+    if _multiplex is None:
+        import adafruit_tca9548a
+        from adafruit_extended_bus import ExtendedI2C
+
+        _multiplex = adafruit_tca9548a.TCA9548A(ExtendedI2C(TCA9548A_I2C_BUS))
+    return _multiplex
+
+
 def tof_measure_value(channel):
-    tof = adafruit_vl53l0x.VL53L0X(multiplex[channel])
-    tof.measurement_timing_budget = 200000
-    return 1 - ((tof.range - 133)/empty_height)
-    # Returns a fraction from 0.0 (empty) to 1.0 (full)
+    import adafruit_vl53l0x
+
+    mux = _get_mux()
+    if channel not in _tof_sensors:
+        tof = adafruit_vl53l0x.VL53L0X(mux[channel])
+        tof.measurement_timing_budget = 200000
+        _tof_sensors[channel] = tof
+    return 1 - ((_tof_sensors[channel].range - 133) / empty_height)
+
 
 def tof_value(channel):
-    rds = []
-    for i in range(0,4):
-        rds.append(tof_measure_value(channel))
+    rds = [tof_measure_value(channel) for _ in range(4)]
     return statistics.median(rds)
 
+
 def set_ultras_leds(color):
+    pixels = _get_pixels()
     for i in range(LED_COUNT):
         pixels[i] = color[i]
     pixels.show()
 
-# Used to determine bin fullness for all bins for battery bin
+
 def ultrasonic_val():
-    distance_mm = ultra_sensor.distance * 1000.0
+    distance_mm = _get_ultra().distance * 1000.0
     return max(0.0, min(1.0, (empty_height - distance_mm) / empty_height))

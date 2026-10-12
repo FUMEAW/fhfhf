@@ -14,6 +14,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Dict, List, Optional
 
+from hardware.config import AS5600_I2C_BUS, CONTINUOUS_SERVO_CHANNEL, SERVO_I2C_BUS
 from hardware.servo_controller import ClosedLoopRotationController, ContinuousRotationServoController, ServoController
 from vision_stuff.vision import YoloDetector
 
@@ -28,12 +29,12 @@ class FlapServoConfig:
 class FlapCalibration:
     """Calibration controller for flap servos and AS5600-based rotation feedback."""
 
-    def __init__(self, servo_bus: int = 1, as5600_bus: int = 4):
+    def __init__(self, servo_bus: int = SERVO_I2C_BUS, as5600_bus: int = AS5600_I2C_BUS):
         self.servo_bus = servo_bus
         self.as5600_bus = as5600_bus
         self.servo = ServoController(bus=self.servo_bus)
         self.rotation = ClosedLoopRotationController(servo_bus=self.servo_bus, as5600_bus=self.as5600_bus)
-        self.continuous_rotation = ContinuousRotationServoController(servo_bus=self.servo_bus, as5600_bus=self.as5600_bus, servo_channel=3)
+        self.continuous_rotation = ContinuousRotationServoController(servo_bus=self.servo_bus, as5600_bus=self.as5600_bus, servo_channel=CONTINUOUS_SERVO_CHANNEL)
         self.detector = YoloDetector(camera_index=None)
         self.model_labels = self._load_model_labels()
         self.slot_limits: Dict[int, FlapServoConfig] = {
@@ -121,7 +122,7 @@ class FlapCalibration:
         
         # Try to refresh encoder connection if needed
         if not self.continuous_rotation.refresh_encoder():
-            raise RuntimeError("AS5600 encoder is not available on bus 4; cannot close the PID loop. Check I2C connections.")
+            raise RuntimeError(f"AS5600 encoder is not available on bus {self.as5600_bus}; cannot close the PID loop. Check I2C connections.")
         
         return self.continuous_rotation.spin_to_target(target_normalized=target_normalized, duration_sec=duration_sec)
 

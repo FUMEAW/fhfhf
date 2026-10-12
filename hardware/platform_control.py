@@ -7,13 +7,19 @@ leveling in one place with explicit, well-named operations.
 from __future__ import annotations
 
 import time
-from typing import Dict, Optional
+from typing import Optional
 
+from hardware.config import SLOT_FLAP_CHANNELS, TILT_CHANNELS
 from hardware.servo_controller import ServoController
 
 
 class PlatformController:
-    """Drive tilt, door, and stable level logic for the sorting platform."""
+    """Drive tilt, door, and stable level logic for the sorting platform.
+
+    PCA9685 channels 0-2 are tilt, channel 3 is the continuous-rotation
+    yaw servo (owned by ClosedLoopRotationController). Slot doors are the
+    flap servos on channels 4-7 — never write door_id as a raw channel.
+    """
 
     SLOT_ANGLES = {
         1: [-15.0, 30.0, 90.0],
@@ -22,20 +28,13 @@ class PlatformController:
         4: [90.0, -15.0, 30.0],
     }
 
-    SLOT_FLAP_MAP = {1: 7, 2: 5, 3: 4, 4: 6}
+    SLOT_FLAP_MAP = SLOT_FLAP_CHANNELS
 
     FLAP_ANGLES = {
         4: [8.0, 38.0],
         5: [-48.0, -72.0],
         6: [-44.0, -76.0],
         7: [-40.0, -75.0],
-    }
-
-    DOOR_ANGLES = {
-        1: [20.0, 90.0],
-        2: [20.0, 90.0],
-        3: [20.0, 90.0],
-        4: [20.0, 90.0],
     }
 
     def __init__(self, servo_controller: Optional[ServoController] = None):
@@ -48,7 +47,7 @@ class PlatformController:
             raise ValueError(f"Invalid slot: {slot}. Must be between 1 and 4.")
 
         angles = self.SLOT_ANGLES[slot]
-        for servo_index, angle in enumerate(angles):
+        for servo_index, angle in zip(TILT_CHANNELS, angles):
             self.controller.set_servo_angle(servo_index, angle)
 
         flap_num = self.SLOT_FLAP_MAP[slot]
@@ -56,23 +55,26 @@ class PlatformController:
         self.current_slot = slot
 
     def level_platform(self) -> None:
-        for servo_index in range(3):
+        for servo_index in TILT_CHANNELS:
             self.controller.set_servo_angle(servo_index, 0.0)
 
         for flap_num in self.SLOT_FLAP_MAP.values():
             self.controller.set_servo_angle(flap_num, self.FLAP_ANGLES[flap_num][1])
         self.current_slot = None
 
+    def _flap_channel(self, slot: int) -> int:
+        if slot not in self.SLOT_FLAP_MAP:
+            raise ValueError(f"Invalid door/slot: {slot}. Must be between 1 and 4.")
+        return self.SLOT_FLAP_MAP[slot]
+
     def open_door(self, door_id: int) -> None:
-        if door_id not in self.DOOR_ANGLES:
-            raise ValueError(f"Invalid door_id: {door_id}. Must be between 1 and 4.")
-        self.controller.set_servo_angle(door_id, self.DOOR_ANGLES[door_id][0])
+        flap_num = self._flap_channel(door_id)
+        self.controller.set_servo_angle(flap_num, self.FLAP_ANGLES[flap_num][0])
         self.current_door_state[door_id] = "open"
 
     def close_door(self, door_id: int) -> None:
-        if door_id not in self.DOOR_ANGLES:
-            raise ValueError(f"Invalid door_id: {door_id}. Must be between 1 and 4.")
-        self.controller.set_servo_angle(door_id, self.DOOR_ANGLES[door_id][1])
+        flap_num = self._flap_channel(door_id)
+        self.controller.set_servo_angle(flap_num, self.FLAP_ANGLES[flap_num][1])
         self.current_door_state[door_id] = "closed"
 
     def vibrate_slot(self, slot: int, amplitude_deg: float = 8.0, duration_sec: float = 0.8) -> None:
