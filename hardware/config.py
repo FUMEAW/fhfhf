@@ -24,8 +24,6 @@ SLOT_FLAP_CHANNELS = {1: 4, 2: 6, 3: 7, 4: 5}  # slot -> PCA9685 channel of the 
 # own TCA9548A channel. The battery bin uses an HC-SR04 ultrasonic on GPIO.
 TOF_MUX_CHANNELS = {"recycling": 0, "compost": 1, "landfill": 2}  # bin -> TCA9548A channel
 ULTRASONIC_BIN = "battery"
-ULTRASONIC_MODE = "gpio"         # "gpio" (HC-SR04 echo/trigger) or "i2c" (RCWL-9620 style)
-ULTRASONIC_I2C_ADDRESS = 0x57    # only used when ULTRASONIC_MODE == "i2c"
 
 # Sensor-to-surface distance (mm) when each bin is empty and when it is full.
 # fill = (empty_mm - reading) / (empty_mm - full_mm), clamped to 0-1.

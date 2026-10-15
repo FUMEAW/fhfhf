@@ -2,8 +2,7 @@
 
 Three VL53L0X time-of-flight sensors (recycling, compost, landfill) sit behind
 a TCA9548A multiplexer, one per channel, because they all share address 0x29.
-The battery bin uses an HC-SR04 ultrasonic sensor on GPIO echo/trigger (or an
-I2C ultrasonic on the multiplexer's bus if ULTRASONIC_MODE is "i2c").
+The battery bin uses an HC-SR04 ultrasonic sensor on GPIO echo/trigger.
 
 Every sensor looks down into its bin and reports a distance. Fill is
     (empty_mm - distance) / (empty_mm - full_mm), clamped to 0-1,
@@ -30,16 +29,12 @@ from hardware.config import (
     TOF_MUX_CHANNELS,
     ULTRASONIC_BIN,
     ULTRASONIC_ECHO,
-    ULTRASONIC_I2C_ADDRESS,
-    ULTRASONIC_MODE,
     ULTRASONIC_TRIGGER,
 )
 
 # VL53L0X reports 8190/8191 when nothing is in range or the reading failed.
 TOF_INVALID_MM = 8000
 TOF_SAMPLES = 4
-# The ultrasonic sensor needs this long between trigger and read.
-ULTRASONIC_MEASURE_SEC = 0.12
 ULTRASONIC_MAX_MM = 4000.0
 
 _pixels = None
@@ -95,16 +90,11 @@ def _get_tof(channel: int):
 def _get_ultra():
     global _ultra_sensor
     if _ultra_sensor is None:
-        if ULTRASONIC_MODE == "gpio":
-            from gpiozero import DistanceSensor
+        from gpiozero import DistanceSensor
 
-            _ultra_sensor = DistanceSensor(
-                echo=ULTRASONIC_ECHO, trigger=ULTRASONIC_TRIGGER, max_distance=4.0
-            )
-        else:
-            from adafruit_bus_device.i2c_device import I2CDevice
-
-            _ultra_sensor = I2CDevice(_get_i2c(), ULTRASONIC_I2C_ADDRESS)
+        _ultra_sensor = DistanceSensor(
+            echo=ULTRASONIC_ECHO, trigger=ULTRASONIC_TRIGGER, max_distance=4.0
+        )
     return _ultra_sensor
 
 
@@ -130,18 +120,8 @@ def tof_distance_mm(channel: int) -> Optional[float]:
 
 
 def ultrasonic_distance_mm() -> Optional[float]:
-    sensor = _get_ultra()
-    if ULTRASONIC_MODE == "gpio":
-        distance = sensor.distance * 1000.0
-    else:
-        # RCWL-9620 protocol: write 0x01 to start, wait, read 3 bytes = micrometres.
-        with sensor:
-            sensor.write(bytes([0x01]))
-        time.sleep(ULTRASONIC_MEASURE_SEC)
-        data = bytearray(3)
-        with sensor:
-            sensor.readinto(data)
-        distance = ((data[0] << 16) | (data[1] << 8) | data[2]) / 1000.0
+    # gpiozero reports max_distance (4 m) when no echo comes back.
+    distance = _get_ultra().distance * 1000.0
     return distance if 0 < distance < ULTRASONIC_MAX_MM else None
 
 
@@ -275,7 +255,8 @@ class BinCapacityMonitor:
 if __name__ == "__main__":
     monitor = BinCapacityMonitor()
     print(f"I2C bus {TCA9548A_I2C_BUS}: ToF channels {TOF_MUX_CHANNELS}, "
-          f"ultrasonic ({ULTRASONIC_MODE}) on {ULTRASONIC_BIN}. Ctrl+C to stop.")
+          f"ultrasonic (trigger GPIO {ULTRASONIC_TRIGGER}, echo GPIO {ULTRASONIC_ECHO}) "
+          f"on {ULTRASONIC_BIN}. Ctrl+C to stop.")
     try:
         while True:
             for name, r in monitor.read_all().items():
