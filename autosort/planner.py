@@ -36,6 +36,7 @@ from autosort.config import (
 from hardware.calibration_store import DEFAULT_TURN_POSITIONS, load_calibration
 from hardware.platform_control import PlatformController
 from hardware.servo_controller import ClosedLoopRotationController
+from hardware.tof_ultrasonic_multiplexer import BinCapacityMonitor
 from vision_stuff.vision import DetectionResult, YoloDetector, draw_slot_wedges
 
 
@@ -45,6 +46,7 @@ class HardwareStatus:
     camera_index: Optional[int] = None
     encoder_available: bool = False
     platform_available: bool = False
+    bin_sensors_available: bool = False
     warnings: list[str] = field(default_factory=list)
 
 
@@ -207,6 +209,7 @@ class AutoSortSystem:
             turn_positions=self.calibration["turn_positions"],
         )
         self.detector.slot_layout = self.calibration["camera"]
+        self.capacity = BinCapacityMonitor()
         if not self.calibration.get("turns_calibrated"):
             print(
                 "WARNING: yaw turn positions are not calibrated; using placeholder guesses "
@@ -227,6 +230,7 @@ class AutoSortSystem:
         self.last_action: Optional[SortAction] = None
         self._last_motion_end = 0.0
         self.failed_count = 0
+        self.blocked_count = 0  # sorts skipped because the target bin was full
 
     # ------------------------------------------------------------------
     # Status
@@ -244,6 +248,8 @@ class AutoSortSystem:
             or getattr(self.platform.controller, "pwm", None) is not None
         )
 
+        bin_sensors_available = self.capacity.available
+
         warnings: list[str] = []
         if not camera_available:
             warnings.append("Camera unavailable")
@@ -251,12 +257,18 @@ class AutoSortSystem:
             warnings.append("AS5600 encoder unavailable")
         if not platform_available:
             warnings.append("PCA9685 platform controller unavailable")
+        if not bin_sensors_available:
+            warnings.append("Bin fill sensors unavailable")
+        full = [name for name, r in self.capacity.snapshot().items() if r["full"]]
+        if full:
+            warnings.append(f"Bin full: {', '.join(full)}")
 
         self.hardware_status = HardwareStatus(
             camera_available=camera_available,
             camera_index=camera_index,
             encoder_available=encoder_available,
             platform_available=platform_available,
+            bin_sensors_available=bin_sensors_available,
             warnings=warnings,
         )
         return self.hardware_status
@@ -370,13 +382,17 @@ class AutoSortSystem:
                 "camera_index": hw.camera_index,
                 "encoder": hw.encoder_available,
                 "platform": hw.platform_available,
+                "bin_sensors": hw.bin_sensors_available,
                 "warnings": hw.warnings,
             },
+            "bins": self.capacity.snapshot(),
+            "full_threshold": self.capacity.full_threshold,
             "yaw_pos": yaw_pos,
             "turn_positions": {str(k): v for k, v in self.bridge.turn_positions.items()},
             "turns_calibrated": bool(self.calibration.get("turns_calibrated")),
             "sorted_count": self.sorted_count,
             "failed_count": self.failed_count,
+            "blocked_count": self.blocked_count,
             "last_action": self.last_action.describe() if self.last_action else None,
         }
         try:
@@ -473,6 +489,12 @@ class AutoSortSystem:
     # ------------------------------------------------------------------
 
     def execute_action(self, action: SortAction) -> bool:
+        if self.capacity.is_full(action.bin_name):
+            # Leave the item in its slot rather than overfill the bin.
+            fill = self.capacity.fill(action.bin_name)
+            print(f"[sort] skipped, {action.bin_name} bin is full ({fill:.0%}): {action.describe()}")
+            self.blocked_count += 1
+            return False
         if self.dry_run:
             print(f"[sort] DRY RUN, would sort: {action.describe()}")
             self._record_history(action, ok=False, duration=0.0)
@@ -516,6 +538,7 @@ class AutoSortSystem:
             self.detector.start()
         except RuntimeError:
             pass
+        self.capacity.start()
         self.refresh_hardware_status()
         if self.hardware_status.encoder_available:
             self.rotation.set_zero()
@@ -539,6 +562,7 @@ class AutoSortSystem:
         except Exception:
             pass
         self.detector.stop()
+        self.capacity.stop()
         try:
             self.rotation.stop()
         except Exception:
@@ -581,11 +605,15 @@ class AutoSortSystem:
             if len(actions) > 1:
                 print(f"[sort] {len(actions)} items on platform, sorting one by one")
             failed_before = self.failed_count
+            blocked_before = self.blocked_count
             for action in actions:
                 self.execute_action(action)
             self._last_motion_end = time.time()
             if self.failed_count > failed_before:
                 print(f"[sort] sort failed; retrying in {self.RETRY_COOLDOWN_SEC:.0f}s")
+                self._last_motion_end += self.RETRY_COOLDOWN_SEC
+            elif self.blocked_count > blocked_before:
+                # An item is waiting on a full bin; don't re-plan it every frame.
                 self._last_motion_end += self.RETRY_COOLDOWN_SEC
 
 

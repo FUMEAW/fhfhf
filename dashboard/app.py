@@ -200,6 +200,24 @@ class AutoSortDashboard:
             st.error(f"Vision error: {vision['error']}")
 
     @st.fragment(run_every=2.0)
+    def render_bin_levels(self) -> None:
+        st.subheader("Bin Fill Levels")
+        bins = load_status().get("bins") or {}
+        if not bins:
+            st.caption("No fill readings yet. Is the sorter running?")
+            return
+        for name in BINS:
+            r = bins.get(name) or {}
+            icon = BIN_ICONS.get(name, "⬜")
+            if r.get("fill") is None:
+                st.markdown(f"**{icon} {name.title()}**: no reading ({r.get('error') or 'waiting'})")
+                st.progress(0.0)
+                continue
+            tag = " :red-badge[FULL]" if r.get("full") else ""
+            st.markdown(f"**{icon} {name.title()}**: {r['fill']:.0%} ({r['distance_mm']:.0f} mm){tag}")
+            st.progress(float(r["fill"]))
+
+    @st.fragment(run_every=2.0)
     def render_bin_counts(self) -> None:
         st.subheader("Items Sorted per Bin")
         sorts = real_sorts(load_history())
@@ -209,7 +227,7 @@ class AutoSortDashboard:
             n = counts.get(name, 0)
             st.markdown(f"**{BIN_ICONS.get(name, '⬜')} {name.title()}**: {n} item{'s' if n != 1 else ''}")
             st.progress(n / total)
-        st.caption("Counts since the history file was started. There is no fill-level sensor wired in yet.")
+        st.caption("Counts since the history file was started.")
 
     @st.fragment(run_every=2.0)
     def render_recent_items(self) -> None:
@@ -324,6 +342,7 @@ class AutoSortDashboard:
             with left_col:
                 self.render_camera_feed()
             with right_col:
+                self.render_bin_levels()
                 self.render_bin_counts()
                 self.render_recent_items()
             self.render_dev_console()
