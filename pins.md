@@ -7,11 +7,19 @@ Hardware I2C `/dev/i2c-1` (GPIO 2 SDA / GPIO 3 SCL)
 - Channel 3: continuous-rotation yaw servo (replaces the DC motor driver)
 - Channels 4-7: slot flaps / doors
 
-##### Ultrasonic Sensor
-G18 - RGB, G24 - Echo, G23 - Trigger
+##### NeoPixel LEDs
+G18
 
-##### TOF Sensor Multiplexer (TCA9548A)
-`/dev/i2c-5`
+##### Bin Fill Sensors (`/dev/i2c-5`)
+- TCA9548A multiplexer (0x70)
+  - Channel 0: VL53L0X, recycling bin
+  - Channel 1: VL53L0X, compost bin
+  - Channel 2: VL53L0X, landfill bin
+- Ultrasonic sensor, battery bin: directly on the bus, I2C mode (0x57)
+  - If wired as HC-SR04 instead: G24 - Echo, G23 - Trigger, and set `ULTRASONIC_MODE = "gpio"`
+
+Channel/bin mapping and empty/full distances live in `hardware/config.py`.
+Test with `python -m hardware.tof_ultrasonic_multiplexer`.
 
 ##### AS5600 Encoder
 `/dev/i2c-4`  (GPIO 5 SDA / GPIO 6 SCL)
