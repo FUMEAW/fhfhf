@@ -2,9 +2,8 @@
 
 Three VL53L0X time-of-flight sensors (recycling, compost, landfill) sit behind
 a TCA9548A multiplexer, one per channel, because they all share address 0x29.
-The battery bin uses an ultrasonic sensor directly on the same I2C bus
-(hardware.config.TCA9548A_I2C_BUS), or on GPIO echo/trigger if
-ULTRASONIC_MODE is "gpio".
+The battery bin uses an HC-SR04 ultrasonic sensor on GPIO echo/trigger (or an
+I2C ultrasonic on the multiplexer's bus if ULTRASONIC_MODE is "i2c").
 
 Every sensor looks down into its bin and reports a distance. Fill is
     (empty_mm - distance) / (empty_mm - full_mm), clamped to 0-1,

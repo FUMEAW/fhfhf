@@ -2,7 +2,7 @@
 
   /dev/i2c-1  PCA9685 servo driver (0x40)
   /dev/i2c-4  AS5600 encoder (0x36)
-  /dev/i2c-5  TCA9548A ToF multiplexer (0x70) + I2C ultrasonic (0x57)
+  /dev/i2c-5  TCA9548A ToF multiplexer (0x70), software I2C on GPIO 23/24
 
 The DC motor driver (GPIO 17/27/22) is retired. Platform yaw is a
 continuous-rotation servo on PCA9685 channel 3 with AS5600 feedback.
@@ -20,13 +20,12 @@ TILT_CHANNELS = (0, 1, 2)
 CONTINUOUS_SERVO_CHANNEL = 3
 SLOT_FLAP_CHANNELS = {1: 4, 2: 6, 3: 7, 4: 5}  # slot -> PCA9685 channel of the flap physically at that slot
 
-# Bin fill sensors, all on TCA9548A_I2C_BUS. The three VL53L0X share address
-# 0x29, so each sits on its own multiplexer channel. The battery bin uses an
-# ultrasonic sensor directly on the same bus (not behind the multiplexer).
+# Bin fill sensors. The three VL53L0X share address 0x29, so each sits on its
+# own TCA9548A channel. The battery bin uses an HC-SR04 ultrasonic on GPIO.
 TOF_MUX_CHANNELS = {"recycling": 0, "compost": 1, "landfill": 2}  # bin -> TCA9548A channel
 ULTRASONIC_BIN = "battery"
-ULTRASONIC_MODE = "i2c"          # "i2c" (RCWL-9620 / RCWL-1601 style) or "gpio" (HC-SR04)
-ULTRASONIC_I2C_ADDRESS = 0x57
+ULTRASONIC_MODE = "gpio"         # "gpio" (HC-SR04 echo/trigger) or "i2c" (RCWL-9620 style)
+ULTRASONIC_I2C_ADDRESS = 0x57    # only used when ULTRASONIC_MODE == "i2c"
 
 # Sensor-to-surface distance (mm) when each bin is empty and when it is full.
 # fill = (empty_mm - reading) / (empty_mm - full_mm), clamped to 0-1.
@@ -38,7 +37,7 @@ BIN_SENSOR_RANGE_MM = {
 }
 BIN_FULL_THRESHOLD = 0.9         # fill at or above this = bin full, stop sorting into it
 
-ULTRASONIC_ECHO = 24             # only used when ULTRASONIC_MODE == "gpio"
-ULTRASONIC_TRIGGER = 23
+ULTRASONIC_ECHO = 20             # 5 V echo: use a voltage divider to 3.3 V
+ULTRASONIC_TRIGGER = 16
 NEOPIXEL_PIN = 18
 LED_COUNT = 6
