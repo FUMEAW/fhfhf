@@ -9,6 +9,12 @@ from __future__ import annotations
 import time
 from typing import Optional
 
+from hardware.calibration_store import (
+    DEFAULT_FLAPS,
+    DEFAULT_LEVEL_TILT,
+    DEFAULT_SLOT_TILT,
+    load_calibration,
+)
 from hardware.config import SLOT_FLAP_CHANNELS, TILT_CHANNELS
 from hardware.servo_controller import ServoController
 
@@ -18,29 +24,40 @@ class PlatformController:
 
     PCA9685 channels 0-2 are tilt, channel 3 is the continuous-rotation
     yaw servo (owned by ClosedLoopRotationController). Slot doors are the
-    flap servos on channels 4-7 — never write door_id as a raw channel.
+    flap servos on channels 4-7, never write door_id as a raw channel.
+
+    Angles come from hardware/calibration.json (see calibrate_platform.py),
+    falling back to the defaults in hardware/calibration_store.py.
     """
 
-    SLOT_ANGLES = {
-        1: [-15.0, 30.0, 90.0],
-        2: [-15.0, 90.0, -15.0],
-        3: [90.0, 30.0, -15.0],
-        4: [90.0, -15.0, 30.0],
-    }
-
+    # Class-level defaults, kept for reference and backwards compatibility.
+    # Instances use self.SLOT_ANGLES / self.FLAP_ANGLES loaded from calibration.
+    SLOT_ANGLES = {slot: list(a) for slot, a in DEFAULT_SLOT_TILT.items()}
     SLOT_FLAP_MAP = SLOT_FLAP_CHANNELS
-
+    # Keyed by PCA9685 channel: [open, closed]
     FLAP_ANGLES = {
-        4: [8.0, 38.0],
-        5: [-48.0, -72.0],
-        6: [-44.0, -76.0],
-        7: [-40.0, -75.0],
+        SLOT_FLAP_CHANNELS[slot]: [f["open"], f["closed"]] for slot, f in DEFAULT_FLAPS.items()
     }
+    LEVEL_ANGLES = list(DEFAULT_LEVEL_TILT)
 
-    def __init__(self, servo_controller: Optional[ServoController] = None):
+    def __init__(
+        self,
+        servo_controller: Optional[ServoController] = None,
+        calibration: Optional[dict] = None,
+    ):
         self.controller = servo_controller or ServoController()
         self.current_slot = None
         self.current_door_state = {1: "closed", 2: "closed", 3: "closed", 4: "closed"}
+        self.apply_calibration(calibration if calibration is not None else load_calibration())
+
+    def apply_calibration(self, cal: dict) -> None:
+        """Replace this instance's angles with a calibration dict."""
+        self.LEVEL_ANGLES = [float(v) for v in cal["level_tilt"]]
+        self.SLOT_ANGLES = {int(s): [float(v) for v in a] for s, a in cal["slot_tilt"].items()}
+        self.FLAP_ANGLES = {
+            self.SLOT_FLAP_MAP[int(s)]: [float(f["open"]), float(f["closed"])]
+            for s, f in cal["flaps"].items()
+        }
 
     def tilt_to_slot(self, slot: int) -> None:
         if slot not in self.SLOT_ANGLES:
@@ -50,16 +67,19 @@ class PlatformController:
         for servo_index, angle in zip(TILT_CHANNELS, angles):
             self.controller.set_servo_angle(servo_index, angle)
 
-        flap_num = self.SLOT_FLAP_MAP[slot]
-        self.controller.set_servo_angle(flap_num, self.FLAP_ANGLES[flap_num][0])
+        # Only the target slot's flap may be open; every other flap stays closed.
+        for other in self.SLOT_FLAP_MAP:
+            if other != slot:
+                self.close_door(other)
+        self.open_door(slot)
         self.current_slot = slot
 
     def level_platform(self) -> None:
-        for servo_index in TILT_CHANNELS:
-            self.controller.set_servo_angle(servo_index, 0.0)
+        for servo_index, angle in zip(TILT_CHANNELS, self.LEVEL_ANGLES):
+            self.controller.set_servo_angle(servo_index, angle)
 
-        for flap_num in self.SLOT_FLAP_MAP.values():
-            self.controller.set_servo_angle(flap_num, self.FLAP_ANGLES[flap_num][1])
+        for door_id in self.SLOT_FLAP_MAP:
+            self.close_door(door_id)
         self.current_slot = None
 
     def _flap_channel(self, slot: int) -> int:

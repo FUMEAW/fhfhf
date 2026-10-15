@@ -83,30 +83,62 @@ class ContinuousRotationServoController:
     """
     Closed-loop PID control for the continuous rotation servo on PCA9685 channel 3.
 
-    Physical limits: safe encoder arc runs from 114° (CW end) to 229° (CCW end).
+    Uses the logical-angle scheme from script.py: the AS5600 reading is
+    converted to a clockwise "logical" angle starting at RAW_START_DEG, so the
+    travel arc runs 0-325 logical degrees with no wrap-around inside it.
+    Readings in the dead zone (logical 270-360) are clamped to the nearest end.
+
+    Normalized positions 0-1 map linearly onto logical 0-325 degrees. All
+    angles this class returns (read_encoder_angle, spin_to_target results) are
+    LOGICAL degrees; use read_raw_angle() for the sensor's own value.
     """
 
     PCA9685_ADDRESS = PCA9685_ADDRESS
     AS5600_ADDRESS = AS5600_ADDRESS
     AS5600_ANGLE_REGISTER = AS5600_ANGLE_REGISTER
-    NEUTRAL_PULSE = 307
-    PULSE_SPAN = 110
+    # Measured on this servo (PCA9685 ticks at 50 Hz): it stays still from
+    # about 304 to 328, so the true stop point is ~316, not the nominal 307.
+    # set_speed() skips that dead band: any real command starts at
+    # NEUTRAL_PULSE +/- DEADBAND_TICKS (about 11 deg/s) and reaches full speed
+    # (about 48 deg/s) PULSE_SPAN ticks further out.
+    NEUTRAL_PULSE = 316
+    DEADBAND_TICKS = 13
+    PULSE_SPAN = 22
+    MIN_COMMAND = 0.02
 
-    ENCODER_MIN = 114.0
-    ENCODER_MAX = 229.0
-    ENCODER_RANGE = ENCODER_MAX - ENCODER_MIN
+    # Zero-crossing arc translation:
+    # Physical Start:   0.0 deg (AS5600 ZPOS burned here) -> Logical 0.0 deg
+    # Physical End:   325.0 deg -> Logical 325.0 deg
+    RAW_START_DEG = 0.0
+    LOGICAL_MIN = 0.0
+    LOGICAL_MAX = 325.0
+    LOGICAL_RANGE = LOGICAL_MAX - LOGICAL_MIN
+    # Dead-zone readings above this snap to LOGICAL_MIN, below it to LOGICAL_MAX.
+    DEAD_ZONE_SPLIT = 342.5
 
-    FORBIDDEN_CCW_START = 229.0
-    FORBIDDEN_CCW_END = 114.0
+    # Kept for callers that still use the old names; these are logical degrees.
+    ENCODER_MIN = LOGICAL_MIN
+    ENCODER_MAX = LOGICAL_MAX
+    ENCODER_RANGE = LOGICAL_RANGE
+
+    # Inverted because the 1:2 gear mesh reverses rotation direction
+    SERVO_DIRECTION = 1.0
+
+    # Target counts as reached within this many logical degrees, and must stay
+    # there for SETTLE_SAMPLES consecutive samples (the servo coasts a little).
+    TOLERANCE_DEG = 2.0
+    SETTLE_SAMPLES = 3
+    # Consecutive failed encoder reads tolerated during a move before aborting.
+    MAX_READ_FAILURES = 3
 
     def __init__(
         self,
         servo_bus=SERVO_I2C_BUS,
         as5600_bus=AS5600_I2C_BUS,
         servo_channel=CONTINUOUS_SERVO_CHANNEL,
-        kp=0.8,
+        kp=0.045,
         ki=0.0,
-        kd=0.3,
+        kd=0.0,
     ):
         self.servo_bus = servo_bus
         self.as5600_bus_id = as5600_bus
@@ -135,25 +167,12 @@ class ContinuousRotationServoController:
             self.encoder_bus = None
             self.encoder_available = False
 
+        # PID setpoint = 0.0, feeding -error to drive positional error to zero
         self.pid = PID(Kp=kp, Ki=ki, Kd=kd, setpoint=0.0, output_limits=(-1.0, 1.0))
         self.target_normalized = 0.0
         self.current_speed = 0.0
 
-    def _safe_error(self, current_deg: float, target_deg: float) -> float:
-        current = current_deg % 360.0
-        target = target_deg % 360.0
-        error = target - current
-        if error > 180:
-            error -= 360
-        elif error < -180:
-            error += 360
-
-        if error < 0:
-            ccw_destination = (current + error) % 360.0
-            if current >= self.FORBIDDEN_CCW_START and ccw_destination < self.FORBIDDEN_CCW_START:
-                error = 360.0 + error
-
-        return error
+    # -- encoder -------------------------------------------------------------
 
     def refresh_encoder(self) -> bool:
         if self.encoder_available and self.encoder_bus is not None:
@@ -173,38 +192,98 @@ class ContinuousRotationServoController:
             self.encoder_available = False
             return False
 
-    def normalized_to_degrees(self, normalized: float) -> float:
-        normalized = max(0.0, min(1.0, float(normalized)))
-        return self.ENCODER_MIN + normalized * self.ENCODER_RANGE
+    # The AS5600 on its bit-banged I2C bus often answers 0x0000 for the first
+    # one to three reads after a pause. Taken at face value that is a fake
+    # position (raw 0 = logical 76 deg) and makes the PID lurch, so zero
+    # reads are retried and only trusted when the last good reading was
+    # already near raw 0.
+    ZERO_READ_RETRIES = 6
+    ZERO_NEAR_DEG = 5.0
 
-    def degrees_to_normalized(self, degrees: float) -> float:
-        if self.ENCODER_RANGE <= 0:
-            return 0.0
-        normalized = (float(degrees) - self.ENCODER_MIN) / self.ENCODER_RANGE
-        return max(0.0, min(1.0, normalized))
+    def _read_raw_once(self):
+        raw = self.encoder_bus.read_i2c_block_data(
+            self.AS5600_ADDRESS, self.AS5600_ANGLE_REGISTER, 2
+        )
+        return ((raw[0] << 8) | raw[1]) & 0x0FFF
 
-    def read_encoder_angle(self) -> float:
+    def try_read_raw_angle(self):
+        """Raw AS5600 angle in degrees (0-360), or None if the read failed."""
         if self.encoder_bus is None:
-            return self.ENCODER_MIN
+            return None
+        last = getattr(self, "_last_raw_deg", None)
         try:
-            raw = self.encoder_bus.read_i2c_block_data(
-                self.AS5600_ADDRESS, self.AS5600_ANGLE_REGISTER, 2
-            )
-            raw_value = ((raw[0] << 8) | raw[1]) & 0x0FFF
-            return (raw_value / 4096.0) * 360.0
+            for _ in range(self.ZERO_READ_RETRIES):
+                value = self._read_raw_once()
+                if value != 0:
+                    break
+            else:
+                # Every read was zero: believe it if we have no earlier reading
+                # (the burned ZPOS makes 0 a real position) or were already near 0 deg.
+                near_zero = last is None or min(last, 360.0 - last) <= self.ZERO_NEAR_DEG
+                if not near_zero:
+                    return None
         except Exception:
             self.encoder_available = False
-            return self.ENCODER_MIN
+            return None
+        self._last_raw_deg = (value / 4096.0) * 360.0
+        return self._last_raw_deg
+
+    def raw_to_logical(self, raw_deg: float) -> float:
+        """Clockwise logical angle (0-325) from a raw reading, clamping the dead zone."""
+        logical_deg = (raw_deg - self.RAW_START_DEG) % 360.0
+        if logical_deg > self.LOGICAL_MAX:
+            if logical_deg > self.DEAD_ZONE_SPLIT:  # closer to the 0.0 start
+                return self.LOGICAL_MIN
+            return self.LOGICAL_MAX               # closer to the 270.0 end
+        return logical_deg
+
+    def try_read_encoder_angle(self):
+        """Logical angle in degrees, or None if the read failed.
+
+        Use this in control loops: read_encoder_angle() returns LOGICAL_MIN on
+        failure, which a PID loop would mistake for a real position.
+        """
+        raw_deg = self.try_read_raw_angle()
+        return None if raw_deg is None else self.raw_to_logical(raw_deg)
+
+    def read_encoder_angle(self) -> float:
+        """Logical angle in degrees (LOGICAL_MIN if the read failed)."""
+        angle = self.try_read_encoder_angle()
+        return self.LOGICAL_MIN if angle is None else angle
+
+    def read_raw_angle(self) -> float:
+        """Raw AS5600 angle in degrees (0.0 if the read failed). For diagnostics."""
+        angle = self.try_read_raw_angle()
+        return 0.0 if angle is None else angle
+
+    # -- conversions -----------------------------------------------------------
+
+    def normalized_to_degrees(self, normalized: float) -> float:
+        normalized = max(0.0, min(1.0, float(normalized)))
+        return self.LOGICAL_MIN + normalized * self.LOGICAL_RANGE
+
+    def degrees_to_normalized(self, degrees: float) -> float:
+        if self.LOGICAL_RANGE <= 0:
+            return 0.0
+        normalized = (float(degrees) - self.LOGICAL_MIN) / self.LOGICAL_RANGE
+        return max(0.0, min(1.0, normalized))
+
+    # -- motion --------------------------------------------------------------------
 
     def set_speed(self, output: float) -> None:
+        """Drive the servo: output -1..1 is mapped past the servo's dead band."""
+        speed = max(-1.0, min(1.0, float(output) * self.SERVO_DIRECTION))
+        self.current_speed = speed
         if self.pwm is None:
             return
-        speed = max(-1.0, min(1.0, float(output)))
-        pulse = self.NEUTRAL_PULSE + int(speed * self.PULSE_SPAN)
-        pulse = max(102, min(512, pulse))
+        if abs(speed) < self.MIN_COMMAND:
+            pulse = self.NEUTRAL_PULSE
+        else:
+            sign = 1.0 if speed > 0 else -1.0
+            pulse = self.NEUTRAL_PULSE + sign * (self.DEADBAND_TICKS + abs(speed) * self.PULSE_SPAN)
+        pulse = max(102, min(512, int(round(pulse))))
         duty_cycle = int((pulse / 4096.0) * 65535)
         self.pwm.channels[self.servo_channel].duty_cycle = duty_cycle
-        self.current_speed = speed
 
     def set_target_normalized(self, normalized: float) -> None:
         self.target_normalized = max(0.0, min(1.0, float(normalized)))
@@ -212,44 +291,77 @@ class ContinuousRotationServoController:
     def spin_to_target(
         self,
         target_normalized: float = 0.0,
-        duration_sec: float = 3.0,
+        duration_sec: float = None,
         update_hz: float = 20.0,
     ) -> dict:
+        """PID-move to a 0-1 position (logical 0-325 degrees).
+
+        The logical range has no internal wrapping, so the error is a plain
+        linear difference. Stops within TOLERANCE_DEG, at the timeout (none if
+        duration_sec is None), on Ctrl+C, or if the encoder stops answering.
+        """
         start = time.monotonic()
         self.set_target_normalized(target_normalized)
         target_deg = self.normalized_to_degrees(target_normalized)
         samples = []
+        read_failures = 0
+        encoder_error = False
+        settled = 0
+        self.pid.reset()
 
-        while time.monotonic() - start < duration_sec:
-            current_deg = self.read_encoder_angle()
-            current_norm = self.degrees_to_normalized(current_deg)
-            error = self._safe_error(current_deg, target_deg)
-            command = self.pid(-error)
+        try:
+            while duration_sec is None or time.monotonic() - start < duration_sec:
+                current_deg = self.try_read_encoder_angle()
+                if current_deg is None:
+                    # Never drive on a guessed position: stop, try to reconnect, retry.
+                    self.set_speed(0.0)
+                    read_failures += 1
+                    if read_failures >= self.MAX_READ_FAILURES:
+                        encoder_error = True
+                        break
+                    self.refresh_encoder()
+                    time.sleep(1.0 / max(update_hz, 1.0))
+                    continue
+                read_failures = 0
 
-            if abs(error) <= 0.5:
-                command = 0.0
+                error = target_deg - current_deg
+                command = self.pid(-error)
+                reached = abs(error) <= self.TOLERANCE_DEG
+                if reached:
+                    command = 0.0
 
-            self.set_speed(command)
-            samples.append({
-                "time": round(time.monotonic() - start, 3),
-                "angle_deg": round(current_deg, 2),
-                "normalized_pos": round(current_norm, 3),
-                "error_deg": round(error, 2),
-                "command": round(command, 3),
-            })
+                self.set_speed(command)
+                samples.append({
+                    "time": round(time.monotonic() - start, 3),
+                    "angle_deg": round(current_deg, 2),
+                    "normalized_pos": round(self.degrees_to_normalized(current_deg), 3),
+                    "error_deg": round(error, 2),
+                    "command": round(command, 3),
+                })
 
-            if abs(error) <= 0.5:
-                break
+                # Only finish once the servo has coasted to a stop inside the band.
+                settled = settled + 1 if reached else 0
+                if settled >= self.SETTLE_SAMPLES:
+                    break
 
-            time.sleep(1.0 / max(update_hz, 1.0))
+                time.sleep(1.0 / max(update_hz, 1.0))
+
+        except KeyboardInterrupt:
+            pass
+        finally:
+            self.set_speed(0.0)
 
         self.set_speed(0.0)
-        final_deg = self.read_encoder_angle()
+        final_deg = None if encoder_error else self.try_read_encoder_angle()
+        if final_deg is None:
+            encoder_error = True
+        nan = float("nan")
         return {
             "target_normalized": target_normalized,
             "target_deg": round(target_deg, 2),
-            "final_angle_deg": round(final_deg, 2),
-            "final_normalized": round(self.degrees_to_normalized(final_deg), 3),
+            "final_angle_deg": nan if encoder_error else round(final_deg, 2),
+            "final_normalized": nan if encoder_error else round(self.degrees_to_normalized(final_deg), 3),
+            "encoder_error": encoder_error,
             "samples": samples,
         }
 
@@ -292,7 +404,7 @@ class ClosedLoopRotationController:
         self.motion_min_deg = self.cont.ENCODER_MIN
         self.motion_max_deg = self.cont.ENCODER_MAX
         self.target_deg = self.cont.ENCODER_MIN
-        self.tolerance_deg = 1.0
+        self.tolerance_deg = self.cont.TOLERANCE_DEG
         self.current_angle_deg = self.cont.ENCODER_MIN
         self.encoder_available = self.cont.encoder_available
 
@@ -320,7 +432,7 @@ class ClosedLoopRotationController:
         t = (float(heading_deg) % 360.0) / 360.0
         return self.motion_min_deg + t * span
 
-    def move_to_normalized(self, normalized: float, timeout: float = 8.0) -> bool:
+    def move_to_normalized(self, normalized: float, timeout: float = 15.0) -> bool:
         self._refresh()
         if not self.encoder_available:
             return False
@@ -328,8 +440,11 @@ class ClosedLoopRotationController:
             target_normalized=max(0.0, min(1.0, float(normalized))),
             duration_sec=timeout,
         )
-        self.current_angle_deg = result["final_angle_deg"]
         self.target_deg = result["target_deg"]
+        if result.get("encoder_error"):
+            self.encoder_available = False
+            return False
+        self.current_angle_deg = result["final_angle_deg"]
         return abs(result["final_angle_deg"] - result["target_deg"]) <= self.tolerance_deg
 
     def move_to(self, target_deg: float, timeout: float = 8.0, step_delay: float = 0.05) -> bool:

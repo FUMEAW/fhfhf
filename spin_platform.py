@@ -9,7 +9,7 @@ from hardware.servo_controller import ContinuousRotationServoController
 
 def main():
     parser = argparse.ArgumentParser(
-        description="Spin the platform using 0-1 normalized position (0=268.33°, 1=286.70°)",
+        description="Spin the platform using 0-1 normalized position (0 = logical 0°, 1 = logical 325°)",
         prog="python spin_platform.py"
     )
     parser.add_argument(
@@ -22,8 +22,8 @@ def main():
     parser.add_argument(
         "-d", "--duration",
         type=float,
-        default=2.0,
-        help="Spin duration in seconds (default: 2.0)"
+        default=None,
+        help="Spin duration in seconds (default: no limit)"
     )
     parser.add_argument(
         "-p", "--print-samples",
@@ -33,7 +33,7 @@ def main():
     
     args = parser.parse_args()
     position = max(0.0, min(1.0, args.position))
-    duration = max(0.1, args.duration)
+    duration = None if args.duration is None else max(0.1, args.duration)
     
     print(f"Initializing platform controller...")
     cont = ContinuousRotationServoController(
@@ -52,10 +52,12 @@ def main():
         sys.exit(1)
     
     print(f"\nSpinning to position {position:.2f} (0-1) = {cont.normalized_to_degrees(position):.2f}°")
-    print(f"Duration: {duration:.1f}s")
+    print("Duration: no limit" if duration is None else f"Duration: {duration:.1f}s")
     print()
     
     result = cont.spin_to_target(target_normalized=position, duration_sec=duration)
+    if result.get("encoder_error"):
+        print("ERROR: lost the AS5600 encoder during the move; the servo was stopped.")
     
     print(f"\n✓ Spin complete!")
     print(f"  Target position: {result['target_normalized']:.2f} (0-1)")

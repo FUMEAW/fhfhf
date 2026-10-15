@@ -1,34 +1,47 @@
 """Vision pipeline for the AutoSort system.
 
-Uses onnxruntime InferenceSession directly — no ultralytics dependency.
-Session startup is explicit (start_session) and inference is a clean
-run_inference call that returns structured DetectionResult objects.
+Uses onnxruntime InferenceSession directly (session pattern borrowed from
+daslearning-org/vision-ai onnx_detect.py), no ultralytics dependency.
 
-Preprocessing follows the reference implementation:
-  - Resize to model input size (default 640x640)
-  - BGR -> RGB
-  - Normalize to [0, 1] float32
-  - Transpose to CHW and add batch dimension
-  - Run session, parse YOLOv8/v11 output tensor
+The exported model in vision_stuff/ai_model is a Roboflow RF-DETR (small)
+detector, NOT a YOLO model. That matters for both ends of the pipeline:
+
+Preprocessing (from inference_config.json):
+  - Stretch-resize to the model input size (512x512)
+  - BGR -> RGB, scale to [0, 1]
+  - ImageNet mean/std normalization
+  - HWC -> CHW, add batch dimension
+
+Outputs:
+  - "dets":   (1, 300, 4)  boxes as normalized (cx, cy, w, h) in [0, 1]
+  - "labels": (1, 300, C)  raw class logits -> sigmoid (NOT softmax)
+  Class index i maps to line i of class_names.txt; index 0 is a background
+  placeholder and is ignored. DETR models are set-based, so no NMS is needed;
+  each query keeps its single best non-background class.
 """
 
 from __future__ import annotations
 
+import json
 import threading
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
-from typing import List, Optional, Tuple
+from typing import Dict, List, Optional, Tuple
 
 import cv2
 import numpy as np
-from onnxruntime import InferenceSession
+from onnxruntime import GraphOptimizationLevel, InferenceSession, SessionOptions
 
 from autosort.config import LABEL_ALIASES
 
 
+IMAGENET_MEAN = (0.485, 0.456, 0.406)
+IMAGENET_STD = (0.229, 0.224, 0.225)
+
+
 # ---------------------------------------------------------------------------
-# Shared result type
+# Shared result types
 # ---------------------------------------------------------------------------
 
 @dataclass
@@ -41,18 +54,83 @@ class DetectionResult:
     slot_num: Optional[int] = None
 
 
+@dataclass
+class VisionStats:
+    """Telemetry snapshot of the inference thread."""
+    session_ok: bool = False
+    camera_available: bool = False
+    inference_count: int = 0
+    last_inference_ms: float = 0.0
+    avg_inference_ms: float = 0.0
+    last_inference_time: float = 0.0
+    # time.time() when the frame behind the current detections was captured
+    last_frame_time: float = 0.0
+    frame_shape: Optional[Tuple[int, int]] = None
+    # Highest score seen per class on the last frame, even below threshold.
+    class_peaks: Dict[str, float] = field(default_factory=dict)
+    last_error: Optional[str] = None
+
+
+# ---------------------------------------------------------------------------
+# Slot geometry
+# ---------------------------------------------------------------------------
+
+# Camera at the landfill corner looking across the platform. The X arms run
+# diagonally through the hub, so each slot is a wedge: top, right, bottom, left.
+DEFAULT_SLOT_LAYOUT = {
+    "center": [0.51, 0.625],  # platform hub as a fraction of image width/height
+    "slots": {"top": 2, "right": 4, "bottom": 3, "left": 1},
+}
+
+
+def wedge_for_point(x: float, y: float, width: int, height: int, center=(0.5, 0.5)) -> Optional[str]:
+    """Which diagonal wedge around the hub a point is in."""
+    if width <= 0 or height <= 0:
+        return None
+    dx = x - center[0] * width
+    dy = y - center[1] * height
+    if abs(dx) >= abs(dy):
+        return "right" if dx >= 0 else "left"
+    return "bottom" if dy >= 0 else "top"
+
+
+def slot_for_point(x: float, y: float, width: int, height: int, layout: Optional[dict] = None) -> Optional[int]:
+    layout = layout or DEFAULT_SLOT_LAYOUT
+    wedge = wedge_for_point(x, y, width, height, layout["center"])
+    return None if wedge is None else int(layout["slots"][wedge])
+
+
+def draw_slot_wedges(img: np.ndarray, layout: Optional[dict] = None) -> None:
+    """Draw the hub, the diagonal slot boundaries, and each wedge's slot number."""
+    layout = layout or DEFAULT_SLOT_LAYOUT
+    h, w = img.shape[:2]
+    cx, cy = int(layout["center"][0] * w), int(layout["center"][1] * h)
+    reach = max(w, h)
+    for sx, sy in ((1, 1), (1, -1), (-1, 1), (-1, -1)):
+        cv2.line(img, (cx, cy), (cx + sx * reach, cy + sy * reach), (255, 255, 0), 1)
+    cv2.circle(img, (cx, cy), 4, (255, 255, 0), -1)
+    offset = int(0.22 * min(w, h))
+    spots = {"top": (0, -offset), "right": (offset, 0), "bottom": (0, offset), "left": (-offset, 0)}
+    for wedge, (ox, oy) in spots.items():
+        cv2.putText(img, f"S{layout['slots'][wedge]}", (cx + ox - 12, cy + oy + 8),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.8, (255, 255, 0), 2)
+
+
 # ---------------------------------------------------------------------------
 # Detector
 # ---------------------------------------------------------------------------
 
 class YoloDetector:
-    """Threaded ONNX-based detector for AutoSort.
+    """Threaded ONNX RF-DETR detector for AutoSort.
+
+    The class name is kept for backwards compatibility with the planner.
 
     Usage:
         detector = YoloDetector(camera_index=2, conf_threshold=0.45)
         detector.start()          # opens camera + inference threads
         detections = detector.get_detections()
         frame = detector.get_frame()
+        stats = detector.get_stats()
         detector.stop()
     """
 
@@ -61,210 +139,249 @@ class YoloDetector:
         camera_index: Optional[int] = None,
         model_path: Optional[str] = None,
         conf_threshold: float = 0.45,
-        input_size: int = 640,
+        input_size: Optional[int] = None,
+        num_threads: int = 4,
     ):
         base_dir = Path(__file__).resolve().parent.parent
+        model_dir = base_dir / "vision_stuff" / "ai_model"
 
         # Search for an existing model file in order of preference
-        default_model: Optional[Path] = None
+        default_model = model_dir / "weights.onnx"
         for candidate in ("weights.onnx", "best.onnx", "model.onnx"):
-            p = base_dir / "vision_stuff" / "ai_model" / candidate
+            p = model_dir / candidate
             if p.exists():
                 default_model = p
                 break
-
-        if default_model is None:
-            # Fall through to a clear error at session-start time
-            default_model = base_dir / "vision_stuff" / "ai_model" / "weights.onnx"
-
         self.model_path = Path(model_path) if model_path else default_model
 
-        # Load class names from class_names.txt, skipping index 0 (background placeholder)
-        class_names_path = base_dir / "vision_stuff" / "ai_model" / "class_names.txt"
+        # class_names.txt line i == model class index i (index 0 = background)
+        class_names_path = model_dir / "class_names.txt"
         self._class_names: List[str] = []
         if class_names_path.exists():
-            lines = class_names_path.read_text().strip().splitlines()
-            self._class_names = [line.strip() for line in lines]
+            self._class_names = [
+                line.strip() for line in class_names_path.read_text().strip().splitlines()
+            ]
+
+        # Normalization and input size from the Roboflow inference config
+        self._mean = np.array(IMAGENET_MEAN, dtype=np.float32)
+        self._std = np.array(IMAGENET_STD, dtype=np.float32)
+        cfg_size: Optional[int] = None
+        cfg_path = model_dir / "inference_config.json"
+        if cfg_path.exists():
+            try:
+                net = json.loads(cfg_path.read_text()).get("network_input", {})
+                norm = net.get("normalization")
+                if norm and len(norm) == 2:
+                    self._mean = np.array(norm[0], dtype=np.float32)
+                    self._std = np.array(norm[1], dtype=np.float32)
+                cfg_size = int(net.get("training_input_size", {}).get("width", 0)) or None
+            except Exception as exc:
+                print(f"WARNING: could not parse {cfg_path.name}: {exc}")
 
         self.camera_index = camera_index
         self.conf_threshold = float(conf_threshold)
-        self.input_size = int(input_size)
+        self.input_size = int(input_size or cfg_size or 512)
+        self.num_threads = int(num_threads)
         self.camera_available = False
+        # Image -> slot mapping; the planner overrides this from calibration.
+        self.slot_layout = {
+            "center": list(DEFAULT_SLOT_LAYOUT["center"]),
+            "slots": dict(DEFAULT_SLOT_LAYOUT["slots"]),
+        }
 
-        # Session state — populated by start_session()
+        # Session state, populated by start_session()
         self._sess: Optional[InferenceSession] = None
         self._input_name: Optional[str] = None
         self._output_names: List[str] = []
-        self._num_classes: int = 0
-        self._orig_w: int = self.input_size
-        self._orig_h: int = self.input_size
+        self._boxes_idx: int = 0
+        self._logits_idx: int = 1
 
         # Camera + threading state
         self.cap: Optional[cv2.VideoCapture] = None
         self._frame: Optional[np.ndarray] = None
+        self._frame_time: float = 0.0
         self._frame_lock = threading.Lock()
 
         self._detections: List[DetectionResult] = []
+        self._detections_frame_time: float = 0.0
         self._detections_lock = threading.Lock()
+
+        self._stats = VisionStats()
+        self._stats_lock = threading.Lock()
 
         self._running = False
         self._capture_thread: Optional[threading.Thread] = None
         self._inference_thread: Optional[threading.Thread] = None
 
     # ------------------------------------------------------------------
-    # Session management — mirrors start_detect_session() from reference
+    # Session management (mirrors start_detect_session() from reference)
     # ------------------------------------------------------------------
 
     def start_session(self) -> bool:
         """Load the ONNX model and start an InferenceSession.
 
-        Returns True on success.  Safe to call multiple times (no-op if already loaded).
+        Returns True on success. Safe to call multiple times.
         """
         if self._sess is not None:
             return True
 
-        model_path = str(self.model_path)
         if not self.model_path.exists():
-            print(f"ONNX model not found: {model_path}")
+            print(f"ONNX model not found: {self.model_path}")
             return False
 
         try:
-            self._sess = InferenceSession(model_path)
-            self._input_name = self._sess.get_inputs()[0].name
-            self._output_names = [o.name for o in self._sess.get_outputs()]
-            # Infer number of classes from output shape: (1, 4+num_classes, 8400)
-            out_shape = self._sess.get_outputs()[0].shape
-            if len(out_shape) == 3:
-                self._num_classes = int(out_shape[1]) - 4
+            opts = SessionOptions()
+            opts.graph_optimization_level = GraphOptimizationLevel.ORT_ENABLE_ALL
+            opts.intra_op_num_threads = self.num_threads
+            self._sess = InferenceSession(
+                str(self.model_path), opts, providers=["CPUExecutionProvider"]
+            )
+            inp = self._sess.get_inputs()[0]
+            self._input_name = inp.name
+            # Trust the model's fixed input size over any config default
+            if len(inp.shape) == 4 and isinstance(inp.shape[2], int):
+                self.input_size = int(inp.shape[2])
+
+            outputs = self._sess.get_outputs()
+            self._output_names = [o.name for o in outputs]
+            # Identify the box tensor (last dim 4) vs. the logits tensor
+            for i, o in enumerate(outputs):
+                if o.name == "dets" or (o.shape and o.shape[-1] == 4):
+                    self._boxes_idx = i
+                    self._logits_idx = 1 - i if len(outputs) == 2 else (i + 1) % len(outputs)
+                    break
+            num_classes = outputs[self._logits_idx].shape[-1]
+            if self._class_names and num_classes != len(self._class_names):
+                print(
+                    f"WARNING: model has {num_classes} classes but class_names.txt "
+                    f"has {len(self._class_names)} entries"
+                )
             print(
                 f"ONNX session started: {self.model_path.name} | "
-                f"input={self._input_name} | "
-                f"outputs={self._output_names} | "
-                f"classes={self._num_classes}"
+                f"input={self._input_name} {inp.shape} | "
+                f"outputs={[(o.name, o.shape) for o in outputs]} | "
+                f"classes={self._class_names}"
             )
+            with self._stats_lock:
+                self._stats.session_ok = True
             return True
         except Exception as exc:
             print(f"Error loading ONNX model: {exc}")
             self._sess = None
+            with self._stats_lock:
+                self._stats.last_error = f"model load: {exc}"
             return False
 
     # ------------------------------------------------------------------
-    # Preprocessing — mirrors onnx_classify.py normalize+transpose pattern
+    # Preprocessing
     # ------------------------------------------------------------------
 
     def _preprocess(self, frame: np.ndarray) -> np.ndarray:
-        """BGR frame → float32 CHW batch tensor normalized to [0, 1]."""
+        """BGR frame -> ImageNet-normalized float32 (1, 3, H, W) tensor."""
         resized = cv2.resize(frame, (self.input_size, self.input_size))
-        rgb = cv2.cvtColor(resized, cv2.COLOR_BGR2RGB)
-        chw = rgb.transpose(2, 0, 1).astype(np.float32) / 255.0
-        return np.expand_dims(chw, axis=0)  # (1, 3, H, W)
+        rgb = cv2.cvtColor(resized, cv2.COLOR_BGR2RGB).astype(np.float32) / 255.0
+        rgb = (rgb - self._mean) / self._std
+        chw = rgb.transpose(2, 0, 1)
+        return np.ascontiguousarray(chw[np.newaxis], dtype=np.float32)
 
     # ------------------------------------------------------------------
-    # Inference — mirrors sess.run() pattern from reference
+    # Inference
     # ------------------------------------------------------------------
 
-    def _run_inference(self, frame: np.ndarray) -> List[DetectionResult]:
+    def run_inference(self, frame: np.ndarray) -> List[DetectionResult]:
         """Run one inference pass on a BGR frame. Returns DetectionResult list."""
         if self._sess is None:
             return []
 
-        self._orig_h, self._orig_w = frame.shape[:2]
+        orig_h, orig_w = frame.shape[:2]
         img_data = self._preprocess(frame)
 
+        t0 = time.perf_counter()
         try:
-            results = self._sess.run(
-                self._output_names,
-                {self._input_name: img_data},
-            )
+            results = self._sess.run(self._output_names, {self._input_name: img_data})
         except Exception as exc:
             print(f"Inference error: {exc}")
+            with self._stats_lock:
+                self._stats.last_error = f"inference: {exc}"
             return []
+        elapsed_ms = (time.perf_counter() - t0) * 1000.0
 
-        # YOLOv8/v11 ONNX output: (1, 4 + num_classes, 8400) — transpose to (8400, 4+nc)
-        raw = np.array(results[0])
-        if raw.ndim == 3:
-            raw = raw[0].T  # (8400, 4+nc)
+        boxes = np.asarray(results[self._boxes_idx])[0]      # (Q, 4)
+        logits = np.asarray(results[self._logits_idx])[0]    # (Q, C)
+        detections, peaks = self._parse_output(boxes, logits, orig_w, orig_h)
 
-        return self._parse_output(raw)
+        with self._stats_lock:
+            s = self._stats
+            s.inference_count += 1
+            s.last_inference_ms = elapsed_ms
+            s.avg_inference_ms = (
+                elapsed_ms if s.inference_count == 1
+                else 0.9 * s.avg_inference_ms + 0.1 * elapsed_ms
+            )
+            s.last_inference_time = time.time()
+            s.frame_shape = (orig_w, orig_h)
+            s.class_peaks = peaks
+            s.last_error = None
+
+        return detections
+
+    # Backwards-compatible alias
+    _run_inference = run_inference
 
     # ------------------------------------------------------------------
-    # Output parsing — anchor-free YOLOv8/v11 style
+    # Output parsing (RF-DETR / DETR style)
     # ------------------------------------------------------------------
 
-    @staticmethod
-    def _softmax(x: np.ndarray) -> np.ndarray:
-        e = np.exp(x - np.max(x, axis=-1, keepdims=True))
-        return e / e.sum(axis=-1, keepdims=True)
+    def _class_name(self, class_id: int) -> str:
+        if self._class_names and class_id < len(self._class_names):
+            return self._class_names[class_id]
+        return str(class_id)
 
-    def _parse_output(self, out: np.ndarray) -> List[DetectionResult]:
-        """Parse the transposed (8400, 4+nc) output tensor."""
-        boxes_cx = out[:, 0]
-        boxes_cy = out[:, 1]
-        boxes_w  = out[:, 2]
-        boxes_h  = out[:, 3]
-        class_logits = out[:, 4:]
+    def _parse_output(
+        self, boxes: np.ndarray, logits: np.ndarray, orig_w: int, orig_h: int
+    ) -> Tuple[List[DetectionResult], Dict[str, float]]:
+        """Convert raw RF-DETR outputs into detections in original pixel coords."""
+        scores = 1.0 / (1.0 + np.exp(-logits.astype(np.float32)))  # sigmoid
+        scores[:, 0] = 0.0  # index 0 is the background placeholder
 
-        # Convert cx/cy/w/h from model-pixel coords to original image coords
-        scale_x = self._orig_w / self.input_size
-        scale_y = self._orig_h / self.input_size
+        peaks = {
+            self._class_name(c): float(scores[:, c].max())
+            for c in range(1, scores.shape[1])
+        }
 
-        x1 = (boxes_cx - boxes_w / 2) * scale_x
-        y1 = (boxes_cy - boxes_h / 2) * scale_y
-        x2 = (boxes_cx + boxes_w / 2) * scale_x
-        y2 = (boxes_cy + boxes_h / 2) * scale_y
-
-        # Confidence = max class score (sigmoid for YOLOv8/v11 — no obj score)
-        scores = self._softmax(class_logits)
-        best_class = np.argmax(scores, axis=1)
+        best_class = scores.argmax(axis=1)
         best_score = scores[np.arange(len(scores)), best_class]
+        keep = np.where(best_score >= self.conf_threshold)[0]
+        keep = keep[np.argsort(-best_score[keep])]
 
-        # Filter below confidence floor
-        keep = best_score >= self.conf_threshold
-        if not keep.any():
-            return []
-
-        x1, y1, x2, y2 = x1[keep], y1[keep], x2[keep], y2[keep]
-        best_class = best_class[keep]
-        best_score = best_score[keep]
-
-        # NMS
-        boxes_nms = np.stack([x1, y1, x2, y2], axis=1).tolist()
-        scores_nms = best_score.tolist()
-        indices = cv2.dnn.NMSBoxes(boxes_nms, scores_nms, self.conf_threshold, iou_threshold=0.45)
-        if len(indices) == 0:
-            return []
-
-        indices = [int(i) for i in np.array(indices).flatten()]
         detections: List[DetectionResult] = []
-
-        for idx in indices:
-            class_id = int(best_class[idx])
-            confidence = float(best_score[idx])
-            bx1, by1, bx2, by2 = float(x1[idx]), float(y1[idx]), float(x2[idx]), float(y2[idx])
-            center_x = int((bx1 + bx2) / 2)
-            center_y = int((by1 + by2) / 2)
-
-            # Map class index to label using class_names.txt
-            # Index 0 is a background placeholder — skip it
-            if class_id == 0:
+        for q in keep:
+            cx, cy, bw, bh = (float(v) for v in boxes[q])
+            x1 = max(0.0, (cx - bw / 2) * orig_w)
+            y1 = max(0.0, (cy - bh / 2) * orig_h)
+            x2 = min(float(orig_w), (cx + bw / 2) * orig_w)
+            y2 = min(float(orig_h), (cy + bh / 2) * orig_h)
+            if x2 <= x1 or y2 <= y1:
                 continue
-            if self._class_names and class_id < len(self._class_names):
-                raw_label = self._class_names[class_id]
-            else:
-                raw_label = str(class_id)
-            normalized = raw_label.lower().strip()
-            mapped = LABEL_ALIASES.get(normalized, normalized)
 
+            class_id = int(best_class[q])
+            normalized = self._class_name(class_id).lower().strip()
+            mapped = LABEL_ALIASES.get(normalized, normalized)
+            if not mapped:
+                continue
+
+            center_x = int((x1 + x2) / 2)
+            center_y = int((y1 + y2) / 2)
             detections.append(DetectionResult(
                 label=mapped,
                 class_id=class_id,
-                confidence=confidence,
-                bbox=(bx1, by1, bx2, by2),
+                confidence=float(best_score[q]),
+                bbox=(x1, y1, x2, y2),
                 center=(center_x, center_y),
-                slot_num=self.get_slot(center_x, center_y, self._orig_w, self._orig_h),
+                slot_num=self.get_slot(center_x, center_y, orig_w, orig_h),
             ))
 
-        return detections
+        return detections, peaks
 
     # ------------------------------------------------------------------
     # Camera helpers
@@ -282,19 +399,9 @@ class YoloDetector:
                 return idx
         return None
 
-    @staticmethod
-    def get_slot(center_x: int, center_y: int, width: int = 1, height: int = 1) -> Optional[int]:
-        if width <= 0 or height <= 0:
-            return None
-        mid_x = width / 2.0
-        mid_y = height / 2.0
-        if center_x < mid_x and center_y < mid_y:
-            return 3
-        if center_x >= mid_x and center_y < mid_y:
-            return 2
-        if center_x < mid_x and center_y >= mid_y:
-            return 4
-        return 1
+    def get_slot(self, center_x: float, center_y: float, width: int = 1, height: int = 1) -> Optional[int]:
+        """Slot (1-4) for an image point, using this detector's slot_layout."""
+        return slot_for_point(center_x, center_y, width, height, self.slot_layout)
 
     # ------------------------------------------------------------------
     # Public lifecycle
@@ -340,6 +447,34 @@ class YoloDetector:
         with self._detections_lock:
             return list(self._detections)
 
+    def get_stats(self) -> VisionStats:
+        with self._stats_lock:
+            snap = VisionStats(**{k: getattr(self._stats, k) for k in self._stats.__dataclass_fields__})
+            snap.class_peaks = dict(self._stats.class_peaks)
+        snap.camera_available = self.camera_available
+        return snap
+
+    def get_detections_since(self, since: float) -> Optional[List[DetectionResult]]:
+        """Detections from a frame captured after `since` (time.time()), else None."""
+        with self._detections_lock:
+            if self._detections_frame_time <= since:
+                return None
+            return list(self._detections)
+
+    def wait_for_detections_since(
+        self, since: float, timeout: float = 60.0, poll: float = 0.1
+    ) -> Optional[List[DetectionResult]]:
+        """Block until a frame captured after `since` has been analyzed."""
+        deadline = time.time() + timeout
+        while time.time() < deadline:
+            dets = self.get_detections_since(since)
+            if dets is not None:
+                return dets
+            if not self._running:
+                return None
+            time.sleep(poll)
+        return None
+
     def get_frame(self) -> Optional[np.ndarray]:
         with self._frame_lock:
             return None if self._frame is None else self._frame.copy()
@@ -356,22 +491,28 @@ class YoloDetector:
                 continue
             with self._frame_lock:
                 self._frame = frame
+                self._frame_time = time.time()
 
     def _inference_loop(self) -> None:
         while self._running:
             with self._frame_lock:
                 frame = None if self._frame is None else self._frame.copy()
+                frame_time = self._frame_time
 
             if frame is None:
                 time.sleep(0.01)
                 continue
 
-            detections = self._run_inference(frame)
+            detections = self.run_inference(frame)
 
             with self._detections_lock:
                 self._detections = detections
+                self._detections_frame_time = frame_time
+            with self._stats_lock:
+                self._stats.last_frame_time = frame_time
 
-            time.sleep(0.05)  # ~20 fps inference cap
+            if self._sess is None:
+                time.sleep(0.5)
 
 
 # ---------------------------------------------------------------------------

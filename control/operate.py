@@ -1,58 +1,45 @@
+"""One-shot sort: detect what is on the platform once, sort it, and stop.
+
+Uses the same planning and motion code as main.py (AutoSortSystem), so slot
+detection, slot-to-bin turns and calibration always match the main sorter.
+"""
+
 import time
 
-from autosort.config import BIN_ANGLES, LABEL_ALIASES, SLOT_MAP, SORTING_RULES
-from hardware.platform_control import PlatformController
-from hardware.servo_controller import ClosedLoopRotationController
-from vision_stuff.vision import YoloDetector
+from autosort.planner import AutoSortSystem
 
 
 class PlatformCommand:
-    def __init__(self, camera_image=None):
+    def __init__(self, camera_image=None, camera_index=None, dry_run=False):
         self.file = camera_image
-        self.rotation = ClosedLoopRotationController()
-        self.platform = PlatformController()
-        self.detector = YoloDetector(camera_index=None)
+        self.system = AutoSortSystem(camera_index=camera_index, dry_run=dry_run)
+        # Kept for backwards compatibility with older callers
+        self.rotation = self.system.rotation
+        self.platform = self.system.platform
+        self.detector = self.system.detector
 
-        # Degrade gracefully if encoder is missing rather than crashing at startup
         if not self.rotation.encoder_available:
-            print("WARNING: AS5600 encoder not found on I2C bus. Rotation will be open-loop.")
-        
-        self.platform.level_platform()
-        
-        if self.rotation.encoder_available:
-            self.rotation.move_to(0.0)
+            print("WARNING: AS5600 encoder not found on I2C bus. Rotation is disabled.")
 
-    def operate_platform(self):
-        self.detector.start()
+    def operate_platform(self, timeout: float = 30.0):
+        """Wait for one fresh detection result, then sort every item found."""
+        self.system.start()
         try:
-            deadline = time.monotonic() + 2.0
-            detections = []
-            while time.monotonic() < deadline:
-                detections = self.detector.get_detections()
-                if detections:
-                    break
-                time.sleep(0.05)
+            started = time.time()
+            detections = self.detector.wait_for_detections_since(started, timeout=timeout)
+            if detections is None:
+                print("Vision failed: no fresh detection result")
+                return []
+            actions = self.system.plan_actions(detections)
+            if not actions:
+                print("Nothing above the confidence threshold to sort")
+                return []
+            for action in actions:
+                self.system.execute_action(action)
+            return actions
         finally:
-            self.detector.stop()
+            self.system.stop()
 
-        if not detections:
-            print("Vision failed: no detections")
-            return
 
-        for det in detections:
-            material = (det.label or "").lower().strip()
-            mapped = LABEL_ALIASES.get(material, material)
-            if mapped is None:
-                continue
-            bin_name = SORTING_RULES.get(mapped, mapped)
-            slot = det.slot_num or SLOT_MAP.get(bin_name)
-            if slot is None or bin_name not in BIN_ANGLES:
-                print(f"Ignoring invalid detection: slot={slot}, material={material}")
-                continue
-
-            if self.rotation.encoder_available:
-                self.rotation.move_to(BIN_ANGLES[bin_name])
-            self.platform.expel_item(slot)
-            if self.rotation.encoder_available:
-                self.rotation.move_to(0.0)
-            self.platform.level_platform()
+if __name__ == "__main__":
+    PlatformCommand().operate_platform()

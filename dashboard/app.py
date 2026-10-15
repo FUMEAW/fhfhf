@@ -1,241 +1,320 @@
 """Streamlit dashboard for the AutoSort system.
 
-The dashboard reads the latest shared camera frame and detection metadata from disk,
-shows bin fill levels, renders a running history of sorted items, and includes live
-encoder telemetry and manual platform rotation controls.
+main.py launches this in the background. The dashboard only READS files that
+the sorter writes, so it never fights the sorter for the camera or I2C bus:
+
+    tmp/autosort_frame.jpg      annotated camera frame (green = will sort)
+    tmp/latest_detection.json   live status: detections, model stats, hardware, yaw
+    tmp/sort_history.jsonl      one line per sorted item
+    hardware/calibration.json   calibrated angles / bin positions
+
+Live sections refresh every second. Manual yaw control is only enabled while
+the sorter is NOT running, because two programs driving the servo at once
+would fight each other.
+
+Run alone for testing:
+    streamlit run dashboard/app.py
 """
 
 from __future__ import annotations
 
 import json
-from pathlib import Path
-from typing import Any, Dict, List
+import sys
 import time
+from collections import Counter
+from pathlib import Path
+from typing import Any, Dict, List, Optional
 
 import cv2
 import numpy as np
 import streamlit as st
-from PIL import Image
 
+# Streamlit puts dashboard/ on sys.path, not the repo root; add it so the
+# hardware and autosort packages import correctly.
+ROOT = Path(__file__).resolve().parent.parent
+if str(ROOT) not in sys.path:
+    sys.path.insert(0, str(ROOT))
+
+TMP_DIR = ROOT / "tmp"
+FRAME_PATH = TMP_DIR / "autosort_frame.jpg"
+STATUS_PATH = TMP_DIR / "latest_detection.json"
+HISTORY_PATH = TMP_DIR / "sort_history.jsonl"
+
+BINS = ["recycling", "battery", "compost", "landfill"]
+BIN_ICONS = {"recycling": "🟢", "battery": "🔴", "compost": "🟤", "landfill": "⚫"}
+HEARTBEAT_TIMEOUT_S = 5.0     # status older than this = sorter not updating
+SORT_TIMEOUT_S = 60.0         # a single sort sequence can take this long
+
+
+# ---------------------------------------------------------------------------
+# File readers
+# ---------------------------------------------------------------------------
+
+def load_status() -> Dict[str, Any]:
+    try:
+        return json.loads(STATUS_PATH.read_text())
+    except Exception:
+        return {}
+
+
+def load_history(limit: int = 2000) -> List[Dict[str, Any]]:
+    if not HISTORY_PATH.exists():
+        return []
+    items: List[Dict[str, Any]] = []
+    try:
+        lines = HISTORY_PATH.read_text().splitlines()[-limit:]
+    except OSError:
+        return []
+    for line in lines:
+        try:
+            items.append(json.loads(line))
+        except ValueError:
+            continue
+    return items
+
+
+def load_frame() -> Optional[np.ndarray]:
+    if not FRAME_PATH.exists():
+        return None
+    img = cv2.imread(str(FRAME_PATH), cv2.IMREAD_COLOR)
+    if img is None:
+        return None
+    return cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
+
+
+def sorter_state(status: Dict[str, Any]) -> str:
+    """'running', 'sorting', 'dry-run', 'stopped' or 'offline'."""
+    if not status:
+        return "offline"
+    age = time.time() - float(status.get("heartbeat", 0))
+    state = status.get("state", "running")
+    if state == "stopped":
+        return "stopped"
+    if state == "sorting" and age < SORT_TIMEOUT_S:
+        return "sorting"
+    if age < HEARTBEAT_TIMEOUT_S:
+        return state
+    return "offline"
+
+
+def real_sorts(history: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    return [h for h in history if h.get("ok") and not h.get("dry_run")]
+
+
+# ---------------------------------------------------------------------------
+# Dashboard
+# ---------------------------------------------------------------------------
 
 class AutoSortDashboard:
-    def __init__(self, frame_path: str | Path | None = None):
-        self.tmp_dir = Path(__file__).resolve().parent.parent / "tmp"
-        self.frame_path = (
-            Path(frame_path) if frame_path else self.tmp_dir / "autosort_frame.jpg"
-        )
-        self.detection_json_path = self.tmp_dir / "latest_detection.json"
-        self.fallback_path = Path(__file__).resolve().parent / "fallback.png"
+    def __init__(self) -> None:
         self.trashcan_id = "🗑️ AutoSort System"
         self.trashcan_location = "Sorting bay / primary intake"
-        self.bin_labels = ["Recycling", "Battery", "Compost", "Landfill"]
-        self.bin_data = {
-            "Recycling": 0.42,
-            "Battery": 0.18,
-            "Compost": 0.67,
-            "Landfill": 0.31,
-        }
-        self.recent_items: List[Dict[str, Any]] = [
-            {"class": "bottle", "confidence": 0.96, "timestamp": "2026-10-11 09:41:02", "bin": "Recycling"},
-            {"class": "banana", "confidence": 0.89, "timestamp": "2026-10-11 09:38:45", "bin": "Compost"},
-        ]
 
-        if "recent_items" not in st.session_state:
-            st.session_state.recent_items = list(self.recent_items)
-
-    def _camera_available(self) -> bool:
-        if self.frame_path.exists():
-            try:
-                if time.time() - self.frame_path.stat().st_mtime < 3.0:
-                    return True
-            except Exception:
-                pass
-
-        for idx in range(2):
-            cap = cv2.VideoCapture(idx)
-            if cap.isOpened():
-                ok, _ = cap.read()
-                cap.release()
-                if ok:
-                    return True
-        return False
-
-    @staticmethod
-    def _encoder_available() -> bool:
-        try:
-            import smbus2
-            for bus in (1, 4, 5, 13, 14):
-                try:
-                    bus_obj = smbus2.SMBus(bus)
-                    try:
-                        bus_obj.read_byte_data(0x36, 0x0E)
-                        return True
-                    except Exception:
-                        pass
-                    finally:
-                        bus_obj.close()
-                except Exception:
-                    continue
-        except Exception:
-            return False
-        return False
-
-    @staticmethod
-    def _platform_available() -> bool:
-        try:
-            import smbus2
-            for bus in (1, 4, 5, 13, 14):
-                try:
-                    bus_obj = smbus2.SMBus(bus)
-                    try:
-                        bus_obj.read_byte_data(0x40, 0x00)
-                        return True
-                    except Exception:
-                        pass
-                    finally:
-                        bus_obj.close()
-                except Exception:
-                    continue
-        except Exception:
-            return False
-        return False
-
-    def _load_frame(self):
-        if self.frame_path.exists():
-            try:
-                img = cv2.imread(str(self.frame_path), cv2.IMREAD_COLOR)
-                if img is not None:
-                    return cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
-            except Exception:
-                pass
-
-        if self.fallback_path.exists():
-            try:
-                return np.array(Image.open(self.fallback_path).convert("RGB"))
-            except Exception:
-                pass
-
-        return None
-
-    def _load_latest_detection(self) -> Dict[str, Any]:
-        if self.detection_json_path.exists():
-            try:
-                with open(self.detection_json_path, "r") as f:
-                    return json.load(f)
-            except Exception:
-                pass
-        return {"class": "None detected", "confidence": 0.0, "bin": "None", "timestamp": "N/A"}
-
-    def sidebar(self):
+    def sidebar(self) -> str:
         st.sidebar.markdown("# AutoSort Pages")
         page = st.sidebar.radio("Select Page:", ["Dashboard", "Statistics", "Information"])
         st.sidebar.divider()
+        st.sidebar.caption("Live data refreshes every second.")
         return page
 
-    def render_header(self):
+    def render_header(self) -> None:
         st.title(self.trashcan_id)
         st.markdown(f":violet-badge[Bin location] **{self.trashcan_location}**")
 
-    def render_system_status(self):
-        camera_ok = self._camera_available()
-        encoder_ok = self._encoder_available()
-        platform_ok = self._platform_available()
-        status = [
-            ("Camera", "live" if camera_ok else "unavailable", "green" if camera_ok else "orange"),
-            ("Encoder", "live" if encoder_ok else "missing", "green" if encoder_ok else "orange"),
-            ("Servo bus", "ready" if platform_ok else "offline", "green" if platform_ok else "orange"),
+    # -- live sections (each refreshes itself) -----------------------------
+
+    @st.fragment(run_every=1.0)
+    def render_system_status(self) -> None:
+        status = load_status()
+        state = sorter_state(status)
+        hw = status.get("hardware", {}) if state != "offline" else {}
+        vision = status.get("vision") or {}
+
+        state_text = {
+            "running": "running",
+            "sorting": "sorting an item",
+            "dry-run": "dry run (no motion)",
+            "stopped": "stopped",
+            "offline": "not running",
+        }[state]
+        items = [
+            ("Sorter", state_text, state in ("running", "sorting", "dry-run")),
+            ("Camera", "live" if hw.get("camera") else "unavailable", bool(hw.get("camera"))),
+            ("AI model", "loaded" if vision.get("model_ok") else "not loaded", bool(vision.get("model_ok"))),
+            ("Encoder", "live" if hw.get("encoder") else "missing", bool(hw.get("encoder"))),
+            ("Servo board", "ready" if hw.get("platform") else "offline", bool(hw.get("platform"))),
         ]
-
         st.caption("System health")
-        cols = st.columns(len(status))
-        for col, (label, value, color) in zip(cols, status):
-            text = f"{label}: {value}"
-            if color == "green":
-                col.success(text)
-            else:
-                col.warning(text)
+        cols = st.columns(len(items))
+        for col, (label, value, good) in zip(cols, items):
+            (col.success if good else col.warning)(f"{label}: {value}")
+        if state == "offline":
+            st.info("The sorter is not running. Start it with `python main.py`.")
 
-    def render_camera_feed(self):
+    @st.fragment(run_every=1.0)
+    def render_camera_feed(self) -> None:
         st.subheader("Live Feed & AI Detections")
-        frame = self._load_frame()
+        status = load_status()
+        frame = load_frame()
         if frame is not None:
-            st.image(frame, use_container_width=True)
+            st.image(frame, width="stretch",
+                     caption="Green boxes will be sorted, orange boxes are below the threshold.")
         else:
             st.info("No live frame available. Waiting for the vision pipeline...")
 
-        # Display Live Detection Readout
-        det = self._load_latest_detection()
         st.markdown("### 🤖 Live AI Inference")
-        det_cols = st.columns(3)
-        det_cols[0].metric("Detected Class", det.get("class", "None"))
-        det_cols[1].metric("Confidence", f"{det.get('confidence', 0.0):.2f}")
-        det_cols[2].metric("Target Bin", det.get("bin", "None"))
+        det_cols = st.columns(4)
+        det_cols[0].metric("Detected Class", status.get("class") or "None")
+        det_cols[1].metric("Confidence", f"{float(status.get('confidence') or 0.0):.2f}")
+        det_cols[2].metric("Target Bin", status.get("bin") or "None")
+        det_cols[3].metric("Slot", status.get("slot") or "-")
 
-    def render_bin_capacity(self):
-        st.subheader("Bin Capacity")
-        bin_colors = {
-            "Recycling": "🟢",
-            "Battery": "🔴",
-            "Compost": "🟤",
-            "Landfill": "⚫",
-        }
-        for label, fill in self.bin_data.items():
-            fill_ratio = max(0.0, min(float(fill), 1.0))
-            icon = bin_colors.get(label, "⬜")
-            st.markdown(f"**{icon} {label}**")
-            st.progress(fill_ratio)
-            st.caption(f"{fill_ratio * 100:.0f}% full")
-
-    def render_recent_items(self):
-        st.subheader("Recently Disposed Items")
-        items = st.session_state.get("recent_items", [])
-        if not items:
-            st.caption("No sorted items yet.")
-            return
-
-        for item in reversed(items[-10:]):
-            conf = item.get("confidence", 0.0)
-            label = item.get("class", "unknown")
-            timestamp = item.get("timestamp", "unknown")
-            bin_name = item.get("bin", "unknown")
-            st.markdown(
-                f"- **{label}** &nbsp;·&nbsp; {conf:.2f} conf &nbsp;·&nbsp; {bin_name} &nbsp;·&nbsp; `{timestamp}`"
+        dets = status.get("detections") or []
+        threshold = float(status.get("threshold") or 0.0)
+        if dets:
+            st.dataframe(
+                [
+                    {
+                        "label": d["label"],
+                        "confidence": d["confidence"],
+                        "slot": d.get("slot"),
+                        "bin": d.get("bin"),
+                        "will sort": d["confidence"] >= threshold,
+                    }
+                    for d in dets
+                ],
+                hide_index=True,
+                width="stretch",
             )
 
-    def render_dev_console(self):
-        with st.expander("🛠️ Developer Console & Telemetry"):
-            current_encoder_pos = "unknown"
-            try:
-                from hardware.servo_controller import ClosedLoopRotationController
-                ctrl = ClosedLoopRotationController()
-                current_encoder_pos = f"{ctrl.read_encoder_angle():.1f}°"
-                ctrl.close()
-            except Exception:
-                pass
+        vision = status.get("vision") or {}
+        peaks = vision.get("class_peaks") or {}
+        if peaks:
+            st.caption(
+                f"Best score per class on the last frame (threshold {threshold:.2f}). "
+                f"Inference {vision.get('last_inference_ms', 0):.0f} ms, "
+                f"{vision.get('inference_count', 0)} frames analyzed."
+            )
+            st.bar_chart(peaks, horizontal=True, height=180)
+        if vision.get("error"):
+            st.error(f"Vision error: {vision['error']}")
 
-            st.write("Latest camera frame:", self.frame_path)
-            st.write("Live detection output:", self._load_latest_detection())
-            st.write("Encoder position:", current_encoder_pos)
-            st.write("Platform state:", st.session_state.get("platform_state", "idle"))
+    @st.fragment(run_every=2.0)
+    def render_bin_counts(self) -> None:
+        st.subheader("Items Sorted per Bin")
+        sorts = real_sorts(load_history())
+        counts = Counter(h.get("bin") for h in sorts)
+        total = max(1, len(sorts))
+        for name in BINS:
+            n = counts.get(name, 0)
+            st.markdown(f"**{BIN_ICONS.get(name, '⬜')} {name.title()}**: {n} item{'s' if n != 1 else ''}")
+            st.progress(n / total)
+        st.caption("Counts since the history file was started. There is no fill-level sensor wired in yet.")
+
+    @st.fragment(run_every=2.0)
+    def render_recent_items(self) -> None:
+        st.subheader("Recently Disposed Items")
+        history = load_history(limit=50)
+        if not history:
+            st.caption("No sorted items yet.")
+            return
+        for item in reversed(history[-10:]):
+            tag = " · dry run" if item.get("dry_run") else ("" if item.get("ok") else " · FAILED")
+            st.markdown(
+                f"- **{item.get('class', 'unknown')}** · {float(item.get('confidence', 0)):.2f} conf · "
+                f"{item.get('bin', '?')} via slot {item.get('slot', '?')}{tag} · `{item.get('timestamp', '')}`"
+            )
+
+    # -- developer console --------------------------------------------------
+
+    def render_dev_console(self) -> None:
+        with st.expander("🛠️ Developer Console & Telemetry"):
+            status = load_status()
+            state = sorter_state(status)
+            st.write("Sorter state:", state)
+            st.write("Last sort:", status.get("last_action") or "none yet")
+            yaw = status.get("yaw_pos")
+            st.write("Yaw position (0-1):", "unknown" if yaw is None else f"{yaw:.3f}")
+            st.write("Live status file:", status or "missing")
 
             st.markdown("---")
             st.subheader("Manual Rotation Test")
-            target_deg = st.slider("Target Heading (°)", 0.0, 360.0, 114.0, 1.0)
-            if st.button("Move Platform to Heading"):
-                with st.spinner(f"Rotating platform to {target_deg}°..."):
+            st.caption("To change flap, tilt or bin positions, run `python calibrate_platform.py` on the Pi.")
+            if state != "offline" and state != "stopped":
+                st.info("Manual rotation is disabled while the sorter is running, so the two don't fight over the servo.")
+                return
+
+            from hardware.calibration_store import load_calibration
+            cal = load_calibration(verbose=False)
+            target = st.slider("Target yaw position (0-1)", 0.0, 1.0, float(cal["turn_positions"][0]), 0.005)
+            cols = st.columns(len(cal["turn_positions"]) + 1)
+            choice: Optional[float] = None
+            if cols[0].button("Move to slider"):
+                choice = target
+            for col, (turn, pos) in zip(cols[1:], sorted(cal["turn_positions"].items())):
+                if col.button(f"turn {turn} ({pos:.2f})"):
+                    choice = pos
+            if choice is not None:
+                with st.spinner(f"Rotating platform to {choice:.3f}..."):
                     try:
                         from hardware.servo_controller import ClosedLoopRotationController
                         ctrl = ClosedLoopRotationController()
-                        success = ctrl.move_to(target_deg)
-                        ctrl.close()
-                        if success:
-                            st.success(f"Successfully reached {target_deg}°!")
+                        try:
+                            ok = ctrl.move_to_normalized(choice)
+                        finally:
+                            ctrl.close()
+                        if ok:
+                            st.success(f"Reached {choice:.3f}")
                         else:
-                            st.warning("Motion completed, but angle verification was outside tolerance.")
+                            st.warning("Motion finished outside tolerance, or the encoder is unavailable.")
                     except Exception as e:
                         st.error(f"Rotation error: {e}")
 
-    def app(self):
+    # -- other pages --------------------------------------------------------
+
+    def render_statistics(self) -> None:
+        st.title("Statistics")
+        history = load_history()
+        sorts = real_sorts(history)
+        if not sorts:
+            st.info("No items sorted yet.")
+            return
+        now = time.time()
+        last_hour = [h for h in sorts if now - float(h.get("time", 0)) < 3600]
+        classes = Counter(h.get("class") for h in sorts)
+        cols = st.columns(4)
+        cols[0].metric("Total sorted", len(sorts))
+        cols[1].metric("Last hour", len(last_hour))
+        cols[2].metric("Most frequent", classes.most_common(1)[0][0])
+        durations = [float(h.get("duration_s", 0)) for h in sorts]
+        cols[3].metric("Avg sort time", f"{sum(durations) / len(durations):.1f}s")
+        failed = [h for h in history if not h.get("ok") and not h.get("dry_run")]
+        if failed:
+            st.warning(f"{len(failed)} sort sequence(s) failed. See the main.py console for details.")
+        st.subheader("Items per bin")
+        st.bar_chart(Counter(h.get("bin") for h in sorts))
+        st.subheader("Items per slot")
+        st.bar_chart({f"slot {k}": v for k, v in sorted(Counter(h.get("slot") for h in sorts).items())})
+
+    def render_information(self) -> None:
+        st.title("Information")
+        st.code(
+            "AI model: vision_stuff/ai_model (RF-DETR small, ONNX)\n"
+            "Model labels: battery, compost, landfill, recycle\n"
+            "Slot: camera wedge the item sits in (diagonal X arms around the hub)\n"
+            "Bin: from the AI label. Bins are fixed at the corners, slots ride on the platform\n"
+            "Rotation: turn 0/90/180/270 so the slot is over its bin, PID to the calibrated yaw\n"
+            "Dispense: tilt toward slot, open flap, vibrate, close, level, turn home"
+        )
+        from hardware.calibration_store import CALIBRATION_PATH, load_calibration
+        st.subheader("Calibration in use")
+        st.caption(
+            f"From {CALIBRATION_PATH}" if CALIBRATION_PATH.exists()
+            else "No calibration.json yet, using built-in defaults. Run `python calibrate_platform.py`."
+        )
+        st.json(load_calibration(verbose=False))
+
+    def app(self) -> None:
         page = self.sidebar()
         if page == "Dashboard":
             self.render_header()
@@ -245,25 +324,14 @@ class AutoSortDashboard:
             with left_col:
                 self.render_camera_feed()
             with right_col:
-                self.render_bin_capacity()
+                self.render_bin_counts()
                 self.render_recent_items()
             self.render_dev_console()
         elif page == "Statistics":
-            st.title("Statistics")
-            st.write("Historical fill rates and throughput metrics can be shown here.")
-            st.metric("Current throughput", "0 items/min")
-            st.metric("Most frequent type", "recycling")
+            self.render_statistics()
         elif page == "Information":
-            st.title("Information")
-            st.write("System health, calibration notes, and installation details live here.")
-            st.code(
-                "AI model: vision_stuff/ai_model\n"
-                "Model labels: battery, compost, landfill, recycle\n"
-                "Rotation: turntable rotation to target bin via PID\n"
-                "Dispense: tilt selected slot, open gate, vibrate, close, reset"
-            )
+            self.render_information()
 
 
 if __name__ == "__main__":
-    app = AutoSortDashboard()
-    app.app()
+    AutoSortDashboard().app()

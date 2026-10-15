@@ -18,7 +18,7 @@ AS5600_ANGLE_REGISTER = 0x0E
 
 TILT_CHANNELS = (0, 1, 2)
 CONTINUOUS_SERVO_CHANNEL = 3
-SLOT_FLAP_CHANNELS = {1: 7, 2: 5, 3: 4, 4: 6}
+SLOT_FLAP_CHANNELS = {1: 4, 2: 6, 3: 7, 4: 5}  # slot -> PCA9685 channel of the flap physically at that slot
 
 ULTRASONIC_ECHO = 24
 ULTRASONIC_TRIGGER = 23

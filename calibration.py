@@ -15,6 +15,8 @@ from pathlib import Path
 from typing import Dict, List, Optional
 
 from hardware.config import AS5600_I2C_BUS, CONTINUOUS_SERVO_CHANNEL, SERVO_I2C_BUS
+from hardware.config import TILT_CHANNELS
+from hardware.platform_control import PlatformController
 from hardware.servo_controller import ClosedLoopRotationController, ContinuousRotationServoController, ServoController
 from vision_stuff.vision import YoloDetector
 
@@ -35,6 +37,7 @@ class FlapCalibration:
         self.servo = ServoController(bus=self.servo_bus)
         self.rotation = ClosedLoopRotationController(servo_bus=self.servo_bus, as5600_bus=self.as5600_bus)
         self.continuous_rotation = ContinuousRotationServoController(servo_bus=self.servo_bus, as5600_bus=self.as5600_bus, servo_channel=CONTINUOUS_SERVO_CHANNEL)
+        self.platform = PlatformController(servo_controller=self.servo)
         self.detector = YoloDetector(camera_index=None)
         self.model_labels = self._load_model_labels()
         self.slot_limits: Dict[int, FlapServoConfig] = {
@@ -100,6 +103,39 @@ class FlapCalibration:
             "encoder_available": bool(self.rotation.encoder_available),
         }
 
+    def tilt_to_slot(self, slot: int) -> List[float]:
+        """Tilt toward a slot using its saved tilt angles (hardware/calibration.json)."""
+        self.platform.tilt_to_slot(slot)
+        return list(self.platform.SLOT_ANGLES[slot])
+
+    def tilt_raw(self, a0: float, a1: float, a2: float) -> List[float]:
+        """Move the three tilt servos to explicit angles (not stored)."""
+        angles = [float(a0), float(a1), float(a2)]
+        for ch, angle in zip(TILT_CHANNELS, angles):
+            self.servo.set_servo_angle(ch, angle)
+        return angles
+
+    def flap(self, slot: int, state: str) -> float:
+        """Open or close a slot's flap (1-4) using its saved open/closed angle."""
+        state = state.lower()
+        if state not in ("open", "closed", "close"):
+            raise ValueError("state must be 'open' or 'closed'")
+        if state == "open":
+            self.platform.open_door(slot)
+            idx = 0
+        else:
+            self.platform.close_door(slot)
+            idx = 1
+        return self.platform.FLAP_ANGLES[self.platform.SLOT_FLAP_MAP[slot]][idx]
+
+    def close_all_flaps(self) -> None:
+        for slot in self.platform.SLOT_FLAP_MAP:
+            self.platform.close_door(slot)
+
+    def level(self) -> List[float]:
+        self.platform.level_platform()
+        return list(self.platform.LEVEL_ANGLES)
+
     def set_rotation_zero(self) -> float:
         if not self.rotation.encoder_available:
             raise RuntimeError("AS5600 encoder is not available. Cannot zero rotation.")
@@ -110,11 +146,17 @@ class FlapCalibration:
             return None
         return self.rotation.read_encoder_angle()
 
-    def spin_continuous_servo(self, target_normalized: float = 0.5, duration_sec: float = 3.0) -> Dict[str, object]:
+    def read_encoder_raw(self) -> Optional[float]:
+        """Raw AS5600 angle in degrees (position 1 reads ~325), or None if unavailable."""
+        if not self.rotation.encoder_available:
+            return None
+        return self.rotation.cont.try_read_raw_angle()
+
+    def spin_continuous_servo(self, target_normalized: float = 0.5, duration_sec: Optional[float] = None) -> Dict[str, object]:
         """Spin the continuous-rotation servo on channel 3 using AS5600 feedback via PID.
         
         Args:
-            target_normalized: 0-1 normalized position (0=min 268.33°, 1=max 286.70°)
+            target_normalized: 0-1 normalized position (0 = logical 0°, 1 = logical 325°)
             duration_sec: how long to run the motion
         """
         if not self.continuous_rotation.servo_available:
@@ -128,8 +170,8 @@ class FlapCalibration:
 
     def live_ai_snapshot(self, seconds: float = 2.0, print_every: float = 0.25) -> List[dict]:
         """Use the existing YOLO detector and model labels from vision_stuff/ai_model."""
-        if self.detector.model is None:
-            raise RuntimeError("YOLO model is not available. Ensure ultralytics is installed and the model exists.")
+        if not self.detector.start_session():
+            raise RuntimeError("ONNX model could not be loaded from vision_stuff/ai_model.")
 
         self.detector.start()
         end_time = time.monotonic() + seconds
@@ -183,10 +225,17 @@ Commands:
   set_limit <slot> <min> <max>
   move <slot> <angle>
   test <slot> <angle> [dwell]
+  tilt <slot>                - tilt toward slot 1-4 using its saved tilt angles
+  tilt <a0> <a1> <a2>        - move the 3 tilt servos to raw angles (not saved)
+  flap <slot> open|closed    - open or close a flap (slot 1-4) using its saved angle
+  flaps closed               - close all flaps
+  define flap [slot]         - set + SAVE open/closed angle of a flap (arrow keys; all 4 if no slot)
+  define tilt [slot]         - set + SAVE the 3 tilt servo angles for a slot (all 4 if no slot)
+  level                      - level the platform, close flaps
   encoder                    - read current encoder angle once
   watch [interval_sec]        - continuously read encoder (default 0.5s, press Ctrl+C to stop)
   zero
-  spin <normalized_0_to_1> [seconds]  - spin to normalized position (0=min 268.33°, 1=max 286.70°)
+  spin <normalized_0_to_1> [seconds]  - spin to normalized position (no time limit unless seconds given; Ctrl+C stops) (0 = logical 0°, 1 = logical 325°)
   ai [seconds]
   help
   quit
@@ -194,6 +243,7 @@ Commands:
 
     def __init__(self):
         self.cal = FlapCalibration()
+        self._definer = None
 
     def run(self) -> None:
         print("AutoSort calibration console")
@@ -254,8 +304,33 @@ Commands:
                     angle = float(args[1])
                     dwell = float(args[2]) if len(args) == 3 else 1.0
                     print(self.cal.test_movement(slot, angle, dwell=dwell))
+                elif cmd == "tilt":
+                    if len(args) == 1:
+                        print(f"Tilted to slot {args[0]}: {self.cal.tilt_to_slot(int(args[0]))}")
+                    elif len(args) == 3:
+                        print(f"Tilt servos set to {self.cal.tilt_raw(*map(float, args))}")
+                    else:
+                        print("Usage: tilt <slot>  or  tilt <a0> <a1> <a2>")
+                elif cmd == "flap":
+                    if len(args) != 2:
+                        print("Usage: flap <slot> open|closed")
+                        continue
+                    angle = self.cal.flap(int(args[0]), args[1])
+                    print(f"Flap {args[0]} {args[1]} at {angle}")
+                elif cmd == "flaps" and args == ["closed"]:
+                    self.cal.close_all_flaps()
+                    print("All flaps closed")
+                elif cmd == "define":
+                    from calibrate_platform import CalibrationConsole, PlatformCalibrator
+                    if self._definer is None:
+                        self._definer = CalibrationConsole(
+                            PlatformCalibrator(use_yaw=False, servo=self.cal.servo))
+                    self._definer._define(args)
+                    self.cal.platform.apply_calibration(self._definer.cal.cal)
+                elif cmd == "level":
+                    print(f"Level: {self.cal.level()}")
                 elif cmd == "encoder":
-                    angle = self.cal.read_encoder()
+                    angle = self.cal.read_encoder_raw()
                     if angle is None:
                         print("AS5600 encoder unavailable")
                     else:
@@ -266,7 +341,7 @@ Commands:
                     print(f"Watching encoder at {interval}s intervals. Press Ctrl+C to stop.")
                     try:
                         while True:
-                            angle = self.cal.read_encoder()
+                            angle = self.cal.read_encoder_raw()
                             if angle is None:
                                 print("\r[unavailable]", end="", flush=True)
                             else:
@@ -278,7 +353,7 @@ Commands:
                     print(f"Zeroed encoder: {self.cal.set_rotation_zero()}")
                 elif cmd == "spin":
                     target_norm = float(args[0]) if args else 0.5
-                    duration = float(args[1]) if len(args) > 1 else 3.0
+                    duration = float(args[1]) if len(args) > 1 else None
                     target_norm = max(0.0, min(1.0, target_norm))
                     print(self.cal.spin_continuous_servo(target_normalized=target_norm, duration_sec=duration))
                 elif cmd == "ai":
